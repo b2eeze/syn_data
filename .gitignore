@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.db-journal
+repos_cache/
+workflow_cache/
+.env
+# SQLite DBs are large, keep one copy
+vuln_ruler_filtered.db
