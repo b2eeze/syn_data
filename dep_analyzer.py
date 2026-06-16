@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Phase 1: 依赖提取 — 从 OpenHarmony 仓库中扫描依赖文件，提取目标组件版本
+Phase 1: 依赖提取 — 从 GitHub 仓库中扫描依赖文件，提取目标组件版本
 
 CVE 输入: 从 uncovered_library_cves.xlsx 读取 target + cve_list，按 top-k 筛选
 
@@ -33,7 +33,7 @@ TAGS_API = "https://api.github.com/repos/{owner}/{repo}/tags"
 TREE_API = "https://api.github.com/repos/{owner}/{repo}/git/trees/{ref}?recursive=1"
 HEADERS = {
     "Accept": "application/vnd.github+json, text/plain",
-    "User-Agent": "openharmony-dep-analyzer",
+    "User-Agent": "dep-analyzer",
 }
 MAVEN_NAMESPACE = "http://maven.apache.org/POM/4.0.0"
 SLEEP_BETWEEN_REQUESTS = 0.2
@@ -607,16 +607,6 @@ def deduplicate_rows(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
     return result
 
 
-def parse_repo_name_from_gitcode(url: str) -> Optional[Tuple[str, str]]:
-    m = re.match(r"https?://gitcode\.com/(?P<owner>[^/]+)/(?P<repo>[^/#?]+?)(?:\.git)?/?$", url.strip())
-    if m:
-        return m.group("owner"), m.group("repo")
-    m = re.match(r"https?://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/#?]+?)(?:\.git)?/?$", url.strip())
-    if m:
-        return m.group("owner"), m.group("repo")
-    return None
-
-
 def load_cves_from_excel(excel_path: str, top_k: Optional[int] = None) -> Dict[str, List[str]]:
     """从 uncovered_library_cves.xlsx 读取每个 target 的 CVE 列表，按 top-k 截取。
     返回 {target_name: [cve_id, ...]}
@@ -639,37 +629,18 @@ def load_cves_from_excel(excel_path: str, top_k: Optional[int] = None) -> Dict[s
 
 
 def load_repos_from_excel(excel_path: str) -> List[Dict[str, str]]:
-    """从 Excel 读取仓库列表，兼容两种格式：
-    - OpenHarmony 格式: 仓库名 / Git Clone URL
-    - GitHub 格式: RepoName (owner/repo) / Tag
-    """
+    """从 Excel 读取仓库列表，格式: RepoName (owner/repo)"""
     df = pd.read_excel(excel_path)
     repos = []
     for _, row in df.iterrows():
-        # 兼容 GitHub 格式 (RepoName = owner/repo)
-        if "RepoName" in df.columns:
-            repo_name = str(row["RepoName"]).strip()
-            if not repo_name or repo_name.lower() == "nan":
-                continue
-            if "/" in repo_name:
-                owner, parsed_repo = repo_name.split("/", 1)
-            else:
-                owner, parsed_repo = "openharmony", repo_name
-            repos.append({"repo_name": repo_name, "owner": owner, "repo": parsed_repo, "url": ""})
-            continue
-
-        # OpenHarmony 格式
-        repo_name = str(row["仓库名"]).strip()
-        url = str(row.get("Git Clone URL", "")).strip()
+        repo_name = str(row["RepoName"]).strip()
         if not repo_name or repo_name.lower() == "nan":
             continue
-        parsed = parse_repo_name_from_gitcode(url) if url else None
-        if parsed:
-            owner, parsed_repo = parsed
+        if "/" in repo_name:
+            owner, parsed_repo = repo_name.split("/", 1)
         else:
-            owner = "openharmony"
-            parsed_repo = repo_name
-        repos.append({"repo_name": repo_name, "owner": owner, "repo": parsed_repo, "url": url})
+            owner, parsed_repo = "", repo_name
+        repos.append({"repo_name": repo_name, "owner": owner, "repo": parsed_repo, "url": f"https://github.com/{repo_name}"})
     LOGGER.info("Loaded %d repos from %s", len(repos), excel_path)
     return repos
 
@@ -711,12 +682,12 @@ def run(repos: List[Dict[str, str]], comp_lookup: Dict, headers: Dict[str, str],
 # ===================================================================
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="OpenHarmony 仓库依赖提取 (Phase 1)")
+    parser = argparse.ArgumentParser(description="GitHub 仓库依赖提取 (Phase 1)")
     parser.add_argument("--github-token", default="", help="GitHub API Token（必需）")
     parser.add_argument("--top-tags", type=int, default=0, help="每个仓库分析的 tag 数量 (0=全部)")
     parser.add_argument("--repo-limit", type=int, default=0, help="限制分析的仓库数量 (0=全部)")
     parser.add_argument("--cache-dir", default=str(DEFAULT_CACHE_DIR), help="本地缓存目录")
-    parser.add_argument("--repos-excel", default="data/openharmony_repos.xlsx", help="仓库列表 Excel")
+    parser.add_argument("--repos-excel", default="data/github_top_repos.xlsx", help="仓库列表 Excel")
     parser.add_argument("--cve-input", default="data/uncovered_library_cves.xlsx", help="CVE 输入文件（含 target_name + cve_list）")
     parser.add_argument("--top-k", type=int, default=0, help="每个 target 选取的 CVE 数量 (0=全部)")
     parser.add_argument("--vuln-db", default="vuln_ruler.db", help="漏洞数据库路径（读取 targets）")

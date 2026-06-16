@@ -92,16 +92,12 @@ def clone_repo(repo_name: str, tag: str, cache_dir: Path) -> Path:
     if repo_path.exists():
         shutil.rmtree(repo_path)
 
-    # 判断 repo 格式：owner/repo（GitHub）还是纯 repo 名（OpenHarmony）
+    # repo 格式：owner/repo
     if "/" in repo_name:
-        # GitHub 公共仓库: owner/repo
         remotes = [f"https://github.com/{repo_name}.git"]
     else:
-        # OpenHarmony 仓库
-        remotes = [
-            f"https://github.com/openharmony/{repo_name}.git",
-            f"https://gitee.com/openharmony/{repo_name}.git",
-        ]
+        LOGGER.warning("Invalid repo name format (expected owner/repo): %s", repo_name)
+        return None
 
     for remote in remotes:
         cmd = ["git", "clone", "--depth", "1", "--branch", tag, remote, str(repo_path)]
