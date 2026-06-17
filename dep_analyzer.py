@@ -11,7 +11,7 @@ import json
 import logging
 import os
 import re
-import sqlite3
+
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -163,35 +163,50 @@ def build_headers(github_token: str = "") -> Dict[str, str]:
 # 数据库加载
 # ===================================================================
 
-def load_targets_from_db(db_path: str) -> List[Dict]:
-    """从 vuln_ruler.db 读取 targets"""
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute("SELECT * FROM targets").fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+# Java 组件 Maven 坐标映射表（target_name → osv_package）
+_JAVA_MAVEN_MAP: Dict[str, str] = {
+    "Spring Boot": "org.springframework.boot:spring-boot",
+    "Apache Tomcat": "org.apache.tomcat:tomcat",
+    "Apache Kafka": "org.apache.kafka:kafka-clients",
+    "Log4j": "org.apache.logging.log4j:log4j-core",
+    "Fastjson2": "com.alibaba.fastjson2:fastjson2",
+    "Apache Solr": "org.apache.solr:solr-core",
+    "Apache Struts2": "org.apache.struts:struts2-core",
+    "Apache Shiro": "org.apache.shiro:shiro-core",
+    "MyBatis": "org.mybatis:mybatis",
+    "Apache Commons IO": "commons-io:commons-io",
+    "Apache Commons Text": "org.apache.commons:commons-text",
+    "Apache XMLBeans": "org.apache.xmlbeans:xmlbeans",
+    "Apache Commons Collections": "org.apache.commons:commons-collections4",
+    "Groovy": "org.apache.groovy:groovy",
+    "Jetty": "org.eclipse.jetty:jetty-server",
+}
 
 
-def build_component_lookup(targets: List[Dict]) -> Dict:
+def load_targets_from_xlsx(xlsx_path: str) -> Dict:
+    """从 uncovered_library_cves.xlsx 读取 target_name + language，构建组件查找表。
+
+    返回:
+        {"java_targets": {name: [(group_id, artifact_id)]},
+         "python_targets": {name: [package_name]}}
     """
-    构建组件查找表：
-    - java_targets: {target_name: [(group_pattern, artifact_pattern)]}
-    - python_targets: {target_name: [package_names]}
-    """
+    df = pd.read_excel(xlsx_path)
     java_targets: Dict[str, List[Tuple[str, str]]] = {}
     python_targets: Dict[str, List[str]] = {}
 
-    for t in targets:
-        name = t["name"]
-        lang = (t.get("language") or "").lower()
-        osv_pkg = (t.get("osv_package") or "").strip()
+    for _, row in df.iterrows():
+        name = str(row["target_name"])
+        lang = str(row.get("language", "")).lower()
 
-        if lang == "java" and osv_pkg and ":" in osv_pkg:
-            parts = osv_pkg.split(":", 1)
-            group_id, artifact_id = parts[0], parts[1]
-            java_targets.setdefault(name, []).append((group_id, artifact_id))
-        elif lang == "python" and osv_pkg:
-            python_targets.setdefault(name, []).append(osv_pkg.lower())
+        if lang == "java":
+            osv_pkg = _JAVA_MAVEN_MAP.get(name, "")
+            if osv_pkg and ":" in osv_pkg:
+                group_id, artifact_id = osv_pkg.split(":", 1)
+                java_targets.setdefault(name, []).append((group_id, artifact_id))
+            else:
+                LOGGER.warning("No Maven coordinate mapping for %s, skipping", name)
+        elif lang == "python":
+            python_targets.setdefault(name, []).append(name.lower())
 
     return {
         "java_targets": java_targets,
@@ -694,7 +709,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=5, help="并发 worker 数 (默认 5)")
     parser.add_argument("--cache-dir", default=str(DEFAULT_CACHE_DIR), help="本地缓存目录")
     parser.add_argument("--repos-excel", default="data/github_top_repos.xlsx", help="仓库列表 Excel")
-    parser.add_argument("--vuln-db", default="vuln_ruler.db", help="漏洞数据库路径（读取 targets）")
+    parser.add_argument("--targets-xlsx", default="data/uncovered_library_cves.xlsx", help="目标组件列表 Excel")
     parser.add_argument("--output", default="data/dep_scan_result.xlsx", help="输出文件路径")
     return parser.parse_args()
 
@@ -708,11 +723,11 @@ def main() -> None:
 
     headers = build_headers(args.github_token)
 
-    LOGGER.info("Loading targets from %s", args.vuln_db)
-    targets = load_targets_from_db(args.vuln_db)
-    comp_lookup = build_component_lookup(targets)
+    LOGGER.info("Loading targets from %s", args.targets_xlsx)
+    comp_lookup = load_targets_from_xlsx(args.targets_xlsx)
+    total = len(comp_lookup["java_targets"]) + len(comp_lookup["python_targets"])
     LOGGER.info("Loaded %d targets: java=%d, python=%d",
-                len(targets), len(comp_lookup["java_targets"]), len(comp_lookup["python_targets"]))
+                total, len(comp_lookup["java_targets"]), len(comp_lookup["python_targets"]))
 
     LOGGER.info("==== Phase 1: Dependency Extraction ====")
     repos = load_repos_from_excel(args.repos_excel)

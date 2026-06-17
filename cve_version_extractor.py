@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Phase 2: CVE 版本提取 — 从 vuln_ruler.db 的 CVE 描述中提取最后一个有漏洞的版本号
+Phase 2: CVE 版本提取 — 从 vuln_ruler_filtered.db 的 CVE 描述中提取最后一个有漏洞的版本号
 
 用法:
-    python cve_version_extractor.py [--base-url ...] [--api-key ...] [--model ...]
+    python cve_version_extractor.py [--targets-xlsx ...] [--base-url ...] [--api-key ...] [--model ...]
 """
 
 import argparse
@@ -74,18 +74,38 @@ GENERIC_UPPER_BOUND_REGEX = re.compile(
 # 数据库加载
 # ===================================================================
 
-def load_cve_records_from_db(db_path: str) -> List[Dict]:
-    """从 vuln_ruler.db 读取 cve_records，关联 targets.name"""
+def load_cve_records(db_path: str, targets_xlsx: str) -> List[Dict]:
+    """读取 CVE 记录：从 xlsx 获取 target→CVE 映射，从 db 获取 content_preview。"""
+    # 1. 从 xlsx 读 target_name → cve_list
+    xlsx_df = pd.read_excel(targets_xlsx)
+    target_cve_map: Dict[str, str] = {}  # cve_id → component_name
+    for _, row in xlsx_df.iterrows():
+        target_name = str(row["target_name"])
+        cve_str = str(row.get("cve_list", "") or "")
+        for cve_id in cve_str.split(","):
+            cve_id = cve_id.strip()
+            if cve_id:
+                target_cve_map[cve_id] = target_name
+    LOGGER.info("Loaded %d CVE IDs from %d targets in %s", len(target_cve_map), len(xlsx_df), targets_xlsx)
+
+    # 2. 从 db 读 cve_records，只看 xlsx 中的 CVE
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-    rows = conn.execute("""
-        SELECT c.*, t.name as component_name, t.language as component_language,
-               t.osv_ecosystem, t.osv_package
-        FROM cve_records c
-        JOIN targets t ON c.target_id = t.id
-    """).fetchall()
+    rows = conn.execute("SELECT cve_id, content_preview FROM cve_records").fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+
+    records = []
+    for r in rows:
+        cve_id = r["cve_id"]
+        if cve_id in target_cve_map:
+            records.append({
+                "cve_id": cve_id,
+                "component_name": target_cve_map[cve_id],
+                "content_preview": r["content_preview"] or "",
+            })
+
+    LOGGER.info("Matched %d CVE records from %s", len(records), db_path)
+    return records
 
 
 # ===================================================================
@@ -235,7 +255,8 @@ def run(cve_records: List[Dict], base_url: str, api_key: str,
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="CVE 版本提取 (Phase 2)")
-    parser.add_argument("--vuln-db", default="vuln_ruler.db", help="漏洞数据库路径")
+    parser.add_argument("--targets-xlsx", default="data/uncovered_library_cves.xlsx", help="目标组件+CVE列表 Excel")
+    parser.add_argument("--vuln-db", default="vuln_ruler_filtered.db", help="CVE 数据库路径（读取 content_preview）")
     parser.add_argument("--output", default="data/cve_version_result.xlsx", help="输出文件路径")
     parser.add_argument("--base-url", default=os.environ.get("LLM_BASE_URL", ""),
                         help="API base URL（也可用 LLM_BASE_URL 环境变量）")
@@ -249,8 +270,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    LOGGER.info("Loading CVE records from %s", args.vuln_db)
-    cve_records = load_cve_records_from_db(args.vuln_db)
+    cve_records = load_cve_records(args.vuln_db, args.targets_xlsx)
     LOGGER.info("Loaded %d CVE records", len(cve_records))
 
     LOGGER.info("==== Phase 2: CVE Version Extraction ====")

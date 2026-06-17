@@ -2,11 +2,6 @@
 """
 Phase 3: 版本匹配 — 将 Phase 1 的依赖版本与 Phase 2 的 CVE 有漏洞版本进行匹配
 
-匹配策略：
-  1. 组件名匹配（归一化后相互包含）
-  2. 有版本号：dep_version <= last_vulnerable_version → 受影响
-  3. 无版本号：LLM 兜底判断
-
 用法:
     python cve_matcher.py [--dep-file ...] [--cve-file ...] [--base-url ...] [--api-key ...] [--model ...]
 """
@@ -217,7 +212,7 @@ def run_phase3(dep_df: pd.DataFrame, cve_df: pd.DataFrame,
     # 为无版本号的 CVE 加载描述
     if not cve_no_ver.empty and base_url and api_key and model:
         try:
-            conn = sqlite3.connect("vuln_ruler.db")
+            conn = sqlite3.connect("vuln_ruler_filtered.db")
             conn.row_factory = sqlite3.Row
             rows = conn.execute("SELECT cve_id, content_preview FROM cve_records").fetchall()
             conn.close()

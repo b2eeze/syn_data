@@ -15,6 +15,7 @@ import re
 import sqlite3
 import subprocess
 import shutil
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -634,92 +635,73 @@ def _extract_function_context(
     return '\n\n'.join(parts)
 
 
-def analyze_vulnerability_pattern(
-    base_url: str, api_key: str, model: str,
-    component: str, used_version: str, vuln_version: str,
-    cve_id: str, description: str,
-    call_sites: Dict[str, List[Tuple[int, str]]],
-    repo_path: Optional[Path] = None,
-    log_dir: Optional[Path] = None,
-    repo_name: str = "",
-    tag: str = "",
-    checkpoints: Optional[dict] = None,
-) -> Optional[dict]:
-    """用 LLM 分析 CVE 描述和当前调用代码，预测漏洞注入方案。返回 JSON dict 或 None。
+BATCH_SIZE = 5  # 每批最多传 5 个文件
+LINE_LIMIT = 80  # 每个文件最多取 80 个命中行
+LLM_MAX_RETRIES = 3  # LLM 调用 JSON 解析失败时最大重试次数
 
-    若提供 checkpoints，会在 prompt 中嵌入结构化信息（safe_condition、match_terms 等），
-    替代原始 description[:2000]。"""
-    if not (base_url and api_key and model):
-        return None
 
-    # 构建调用点上下文：传入完整函数源码而不只是命中行
-    file_limit = 5  # 最多传 5 个文件
-    line_limit = 80  # 每个文件最多取 80 个命中行（用于去重前）
+def _build_cve_info_block(checkpoints: Optional[dict], description: str) -> str:
+    """构建 CVE 信息块：优先用结构化 checkpoints，否则回退到原始描述。"""
+    if not checkpoints:
+        return description[:2000]
+
+    safe_cond = checkpoints.get("safe_condition", "")
+    preconditions = checkpoints.get("preconditions", [])
+    match_terms = checkpoints.get("match_terms", {})
+    version_constraint = checkpoints.get("version_constraint", {})
+    cp_list = checkpoints.get("check_points", [])
+
+    parts = []
+    if safe_cond:
+        parts.append(f"**安全条件**: {safe_cond}")
+    if version_constraint:
+        parts.append(
+            f"**版本范围**: ecosystem={version_constraint.get('ecosystem', '')}, "
+            f">= {version_constraint.get('introduced', '?')}, "
+            f"< {version_constraint.get('fixed', '?')}"
+        )
+    if preconditions:
+        parts.append(f"**前置条件**: {'; '.join(preconditions)}")
+    priority_order = {"critical": 0, "high": 1, "medium": 2}
+    sorted_cps = sorted(cp_list, key=lambda cp: priority_order.get(cp.get("priority", ""), 99))
+    for cp in sorted_cps:
+        pid = cp.get("id", "")
+        priority = cp.get("priority", "")
+        q = cp.get("question", "")
+        htc = cp.get("how_to_check", "")
+        pc = cp.get("pass_condition", "")
+        if q:
+            parts.append(f"**检查点[{priority}] {pid}**: {q} | 如何检查: {htc} | 通过条件: {pc}")
+    if match_terms.get("modules"):
+        parts.append(f"**受影响模块**: {', '.join(match_terms['modules'])}")
+    if match_terms.get("config_keys"):
+        parts.append(f"**相关配置项**: {', '.join(match_terms['config_keys'])}")
+    if match_terms.get("concepts"):
+        parts.append(f"**漏洞概念**: {', '.join(match_terms['concepts'])}")
+
+    return "\n".join(parts) if parts else description[:2000]
+
+
+def _build_call_site_text(repo_path: Optional[Path], call_sites_batch: List[Tuple[str, List[Tuple[int, str]]]]) -> str:
+    """将一批调用点文件构建为 prompt 上下文文本。"""
     context_parts = []
-    for fpath, lines in list(call_sites.items())[:file_limit]:
-        # 判断语言
+    for fpath, lines in call_sites_batch:
         language = "java" if fpath.endswith('.java') else "python"
-
-        # 尝试提取完整函数上下文
-        func_ctx = _extract_function_context(repo_path, fpath, lines[:line_limit], language) if repo_path else ""
-
+        func_ctx = _extract_function_context(repo_path, fpath, lines[:LINE_LIMIT], language) if repo_path else ""
         if func_ctx:
             context_parts.append(func_ctx)
         else:
-            # 回退：只传命中行（原逻辑）
-            fallback_lines = []
-            fallback_lines.append(f"\n### 文件: {fpath}")
-            for ln, code in lines[:line_limit]:
+            fallback_lines = [f"\n### 文件: {fpath}"]
+            for ln, code in lines[:LINE_LIMIT]:
                 fallback_lines.append(f"  L{ln}: {code}")
             context_parts.append('\n'.join(fallback_lines))
+    return '\n\n'.join(context_parts)
 
-    call_site_text = '\n\n'.join(context_parts)
 
-    if not call_site_text:
-        return None
-
-    # 构建 CVE 信息块：优先用结构化 checkpoints，否则回退到原始描述
-    if checkpoints:
-        safe_cond = checkpoints.get("safe_condition", "")
-        preconditions = checkpoints.get("preconditions", [])
-        match_terms = checkpoints.get("match_terms", {})
-        version_constraint = checkpoints.get("version_constraint", {})
-        cp_list = checkpoints.get("check_points", [])
-
-        cve_info_parts = []
-        if safe_cond:
-            cve_info_parts.append(f"**安全条件**: {safe_cond}")
-        if version_constraint:
-            cve_info_parts.append(
-                f"**版本范围**: ecosystem={version_constraint.get('ecosystem', '')}, "
-                f">= {version_constraint.get('introduced', '?')}, "
-                f"< {version_constraint.get('fixed', '?')}"
-            )
-        if preconditions:
-            cve_info_parts.append(f"**前置条件**: {'; '.join(preconditions)}")
-        # check_points 按 priority 分等级选取: critical > high > medium
-        priority_order = {"critical": 0, "high": 1, "medium": 2}
-        sorted_cps = sorted(cp_list, key=lambda cp: priority_order.get(cp.get("priority", ""), 99))
-        for cp in sorted_cps:
-            pid = cp.get("id", "")
-            priority = cp.get("priority", "")
-            q = cp.get("question", "")
-            htc = cp.get("how_to_check", "")
-            pc = cp.get("pass_condition", "")
-            if q:
-                cve_info_parts.append(f"**检查点[{priority}] {pid}**: {q} | 如何检查: {htc} | 通过条件: {pc}")
-        if match_terms.get("modules"):
-            cve_info_parts.append(f"**受影响模块**: {', '.join(match_terms['modules'])}")
-        if match_terms.get("config_keys"):
-            cve_info_parts.append(f"**相关配置项**: {', '.join(match_terms['config_keys'])}")
-        if match_terms.get("concepts"):
-            cve_info_parts.append(f"**漏洞概念**: {', '.join(match_terms['concepts'])}")
-
-        cve_info_block = "\n".join(cve_info_parts) if cve_info_parts else description[:2000]
-    else:
-        cve_info_block = description[:2000]
-
-    prompt = (
+def _build_prompt(cve_id: str, component: str, used_version: str, vuln_version: str,
+                  cve_info_block: str, call_site_text: str) -> str:
+    """构建 LLM prompt（不含系统消息）。"""
+    return (
         "你是一位安全研究员，负责分析 CVE 漏洞并找到项目中可利用的注入点。\n\n"
         f"**CVE 编号**: {cve_id}\n"
         f"**组件**: {component}\n"
@@ -771,54 +753,159 @@ def analyze_vulnerability_pattern(
         "注意：modifications 中 old_code 和 new_code 必须是完整的单行或多行代码，可直接用于字符串替换。"
     )
 
+
+def _call_llm_once(base_url: str, api_key: str, model: str, prompt: str,
+                   cve_id: str, component: str, used_version: str, vuln_version: str,
+                   repo_name: str, tag: str, log_dir: Optional[Path],
+                   batch_idx: int) -> Optional[dict]:
+    """单次 LLM 调用（JSON 解析失败时自动重试）。返回 parsed dict 或 None。"""
     url = base_url.rstrip("/") + "/chat/completions"
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": "You are a precise security vulnerability researcher. Reply JSON only."},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0,
-    }
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
     response_text = ""
 
-    # 写日志
     log_record = {
         "cve_id": cve_id,
         "component": component,
         "used_version": used_version,
         "vuln_version": vuln_version,
+        "batch": batch_idx,
         "prompt": prompt,
         "response_raw": None,
         "parsed": None,
         "error": None,
+        "retries": 0,
     }
 
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
-        response_text = response.text or ""
-        response.raise_for_status()
-        data = response.json()
-        content = data["choices"][0]["message"]["content"]
-        log_record["response_raw"] = content
-        stripped = re.sub(r"^```(?:json)?\s*", "", content.strip(), flags=re.IGNORECASE)
-        stripped = re.sub(r"\s*```$", "", stripped)
-        parsed = json.loads(stripped)
-        log_record["parsed"] = parsed
-        return parsed
-    except Exception as exc:
-        details = f" response_text={response_text[:500]}" if response_text else ""
-        log_record["error"] = f"{exc}{details}"
-        log_record["response_raw"] = response_text[:2000] if response_text else None
-        LOGGER.warning("LLM analysis failed for %s: %s%s", cve_id, exc, details)
+    for attempt in range(1, LLM_MAX_RETRIES + 1):
+        try:
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "You are a precise security vulnerability researcher. Reply JSON only."},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0,
+            }
+            response = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
+            response_text = response.text or ""
+            response.raise_for_status()
+            data = response.json()
+            content = data["choices"][0]["message"]["content"]
+            log_record["response_raw"] = content
+            stripped = re.sub(r"^```(?:json)?\s*", "", content.strip(), flags=re.IGNORECASE)
+            stripped = re.sub(r"\s*```$", "", stripped)
+            parsed = json.loads(stripped)
+            log_record["retries"] = attempt - 1
+            log_record["parsed"] = parsed
+            return parsed
+        except json.JSONDecodeError as exc:
+            LOGGER.warning("LLM JSON parse failed for %s batch %d (%d/%d): %s",
+                           cve_id, batch_idx, attempt, LLM_MAX_RETRIES, exc)
+            if attempt < LLM_MAX_RETRIES:
+                continue
+            log_record["error"] = str(exc)
+            log_record["response_raw"] = response_text[:2000] if response_text else None
+            log_record["retries"] = attempt
+            return None
+        except Exception as exc:
+            details = f" response_text={response_text[:500]}" if response_text else ""
+            LOGGER.warning("LLM analysis failed for %s batch %d (%d/%d): %s%s",
+                           cve_id, batch_idx, attempt, LLM_MAX_RETRIES, exc, details)
+            if attempt < LLM_MAX_RETRIES:
+                continue
+            log_record["error"] = f"{exc}{details}"
+            log_record["response_raw"] = response_text[:2000] if response_text else None
+            log_record["retries"] = attempt
+            return None
+        finally:
+            _write_llm_log(log_dir, cve_id, component, repo_name, tag, log_record, batch_idx)
+
+    return None
+
+
+def _merge_batch_results(results: List[dict]) -> dict:
+    """合并多个 batch 的 LLM 结果。优先级: injectable > already_vulnerable > not_injectable。"""
+    injectables = [r for r in results if r.get("status") == "injectable"]
+    if injectables:
+        merged_mods = []
+        reasons = []
+        for r in injectables:
+            merged_mods.extend(r.get("modifications", []))
+            if r.get("reason"):
+                reasons.append(r["reason"])
+        result = injectables[0].copy()
+        result["modifications"] = merged_mods
+        result["reason"] = "; ".join(reasons)
+        return result
+
+    already_vuln = [r for r in results if r.get("status") == "already_vulnerable"]
+    if already_vuln:
+        return already_vuln[0]
+
+    # 全部 not_injectable
+    return results[0]
+
+
+def analyze_vulnerability_pattern(
+    base_url: str, api_key: str, model: str,
+    component: str, used_version: str, vuln_version: str,
+    cve_id: str, description: str,
+    call_sites: Dict[str, List[Tuple[int, str]]],
+    repo_path: Optional[Path] = None,
+    log_dir: Optional[Path] = None,
+    repo_name: str = "",
+    tag: str = "",
+    checkpoints: Optional[dict] = None,
+) -> Optional[dict]:
+    """用 LLM 分析 CVE 描述和当前调用代码，预测漏洞注入方案。返回 JSON dict 或 None。
+
+    若 call_sites 文件数超过 BATCH_SIZE，则分批多次调用 LLM，
+    然后合并结果（injectable 优先，modifications 聚合）。
+
+    若提供 checkpoints，会在 prompt 中嵌入结构化信息（safe_condition、match_terms 等），
+    替代原始 description[:2000]。"""
+    if not (base_url and api_key and model):
         return None
-    finally:
-        _write_llm_log(log_dir, cve_id, component, repo_name, tag, log_record)
+
+    call_site_items = list(call_sites.items())
+    if not call_site_items:
+        return None
+
+    # 分批
+    batches = [call_site_items[i:i + BATCH_SIZE] for i in range(0, len(call_site_items), BATCH_SIZE)]
+
+    # 构建 CVE 信息块（所有 batch 共用）
+    cve_info_block = _build_cve_info_block(checkpoints, description)
+
+    all_results: List[dict] = []
+    for batch_idx, batch_items in enumerate(batches):
+        call_site_text = _build_call_site_text(repo_path, batch_items)
+        if not call_site_text:
+            continue
+
+        prompt = _build_prompt(cve_id, component, used_version, vuln_version, cve_info_block, call_site_text)
+
+        LOGGER.info("  LLM batch %d/%d for %s / %s (%d files)",
+                    batch_idx + 1, len(batches), cve_id, component, len(batch_items))
+
+        result = _call_llm_once(base_url, api_key, model, prompt,
+                                cve_id, component, used_version, vuln_version,
+                                repo_name, tag, log_dir, batch_idx)
+        if result:
+            all_results.append(result)
+
+    if not all_results:
+        return None
+
+    if len(all_results) == 1:
+        return all_results[0]
+
+    return _merge_batch_results(all_results)
 
 
-def _write_llm_log(log_dir: Optional[Path], cve_id: str, component: str, repo_name: str, tag: str, record: dict) -> None:
-    """将 LLM 输入输出写入 JSON 文件。"""
+def _write_llm_log(log_dir: Optional[Path], cve_id: str, component: str, repo_name: str,
+                    tag: str, record: dict, batch_idx: int = 0) -> None:
+    """将 LLM 输入输出写入 JSON 文件。batch_idx 仅在 > 0 时追加到文件名。"""
     if log_dir is None:
         return
     try:
@@ -827,7 +914,8 @@ def _write_llm_log(log_dir: Optional[Path], cve_id: str, component: str, repo_na
         safe_comp = component.replace("/", "_").replace(" ", "_")
         safe_repo = repo_name.replace("/", "_").replace(" ", "_")
         safe_tag = tag.replace("/", "_").replace(" ", "_")
-        log_path = log_dir / f"{safe_cve}__{safe_comp}__{safe_repo}__{safe_tag}.json"
+        suffix = f"__batch{batch_idx}" if batch_idx > 0 else ""
+        log_path = log_dir / f"{safe_cve}__{safe_comp}__{safe_repo}__{safe_tag}{suffix}.json"
         log_path.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception as exc:
         LOGGER.warning("Failed to write LLM log for %s: %s", cve_id, exc)
@@ -869,14 +957,15 @@ def apply_injections(repo_path: Path, modifications: List[dict]) -> List[str]:
     return modified_files
 
 
-def _save_patch_and_restore(repo_path: Path, patch_dir: Path, cve_id: str, repo_name: str) -> Optional[str]:
+def _save_patch_and_restore(repo_path: Path, patch_dir: Path, cve_id: str, repo_name: str, tag: str = "") -> Optional[str]:
     """保存当前修改为 patch 文件，然后恢复仓库到干净状态。返回 patch 文件路径或 None。"""
     patch_path = None
     try:
         patch_dir.mkdir(parents=True, exist_ok=True)
         safe_cve = cve_id.replace("/", "_").replace(" ", "_")
         safe_repo = repo_name.replace("/", "_").replace(" ", "_")
-        patch_path = patch_dir / f"{safe_cve}__{safe_repo}.patch"
+        safe_tag = tag.replace("/", "_").replace(" ", "_")
+        patch_path = patch_dir / f"{safe_cve}__{safe_repo}__{safe_tag}.patch"
         diff_result = subprocess.run(
             ["git", "diff"],
             cwd=str(repo_path), capture_output=True, text=True, timeout=30
@@ -927,6 +1016,28 @@ def _find_mvn() -> str:
     return "mvn"  # 回退，让 subprocess 报错
 
 
+def _ensure_clean_repo(repo_path: Path, tag: str) -> bool:
+    """确认 repo 在指定 tag 上且无未提交修改。不干净则 git checkout . 恢复。
+    返回 True 表示已恢复或本来就是干净的。"""
+    try:
+        # 检查是否有未提交修改
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(repo_path), capture_output=True, text=True, timeout=10
+        )
+        if status.stdout.strip():
+            LOGGER.warning("Repo dirty, restoring: %s @ %s", repo_path.name, tag)
+            subprocess.run(["git", "checkout", "."], cwd=str(repo_path),
+                          capture_output=True, text=True, timeout=30)
+            subprocess.run(["git", "clean", "-fd"], cwd=str(repo_path),
+                          capture_output=True, text=True, timeout=30)
+            LOGGER.info("Repo restored to clean state")
+        return True
+    except Exception as exc:
+        LOGGER.warning("Failed to verify clean repo: %s", exc)
+        return True  # 不阻塞流程
+
+
 def _get_java_version() -> Optional[int]:
     """获取当前 java 的主版本号（8/11/17/21 等）。"""
     try:
@@ -946,58 +1057,234 @@ def _get_java_version() -> Optional[int]:
 
 
 def _parse_required_java_version(module_root: Path) -> Optional[Tuple[int, int]]:
-    """从 pom.xml 或 build.gradle 解析项目要求的 JDK 版本范围。
+    """从 pom.xml（含父 pom）或 build.gradle 解析项目要求的 JDK 版本范围。
 
     返回 (min_ver, max_ver) 或 None（无法解析时）。
     例如 JDK [1.8,1.9) → (8, 8)；JDK >= 11 → (11, None)
     """
-    # Maven: 检查 maven-enforcer-plugin 的 requireJavaVersion 规则
-    pom = module_root / "pom.xml"
-    if pom.exists():
+    # Maven: 检查模块 pom.xml 及父 pom（向上最多 6 层）
+    for _ in range(6):
+        pom = module_root / "pom.xml"
+        if not pom.exists():
+            break
         try:
             content = pom.read_text(encoding="utf-8", errors="replace")
+            # 去掉换行便于跨行正则匹配
+            flat = content.replace('\n', ' ')
             # 匹配 <requireJavaVersion><version>[1.8,1.9)</version></requireJavaVersion>
-            versions = re.findall(r'<requireJavaVersion>\s*<version>\[(\d+(?:\.\d+)*),(\d+(?:\.\d+)*)\)</version>', content)
-            if versions:
-                min_ver = int(versions[0][0].split(".")[-1])
-                max_ver = int(versions[0][1].split(".")[-1]) - 1
-                return (min_ver, max_ver)
-            # 匹配 <maven.compiler.source>1.8</maven.compiler.source>
-            m = re.search(r'<maven\.compiler\.source>1\.(\d+)</maven\.compiler\.source>', content)
+            m = re.search(r'<requireJavaVersion>\s*<version>\[(\d+(?:\.\d+)*),\s*(\d+(?:\.\d+)*)\)\s*</version>', flat)
             if m:
-                ver = int(m.group(1))
-                return (ver, None)
-            m = re.search(r'<maven\.compiler\.source>(\d+)</maven\.compiler\.source>', content)
+                min_ver = int(m.group(1).split(".")[-1])
+                max_ver = int(m.group(2).split(".")[-1]) - 1
+                return (min_ver, max_ver)
+            # 匹配 java.version 属性
+            m = re.search(r'<java\.version>1\.(\d+)</java\.version>', flat)
+            if m:
+                return (int(m.group(1)), None)
+            m = re.search(r'<java\.version>(\d+)</java\.version>', flat)
+            if m:
+                return (int(m.group(1)), None)
+            # 匹配 maven.compiler.source
+            m = re.search(r'<maven\.compiler\.source>1\.(\d+)</maven\.compiler\.source>', flat)
+            if m:
+                return (int(m.group(1)), None)
+            m = re.search(r'<maven\.compiler\.source>(\d+)</maven\.compiler\.source>', flat)
             if m:
                 return (int(m.group(1)), None)
         except Exception:
             pass
+        # 尝试父 pom
+        module_root = module_root.parent
 
-    # Gradle: 检查 sourceCompatibility
-    for gradle_file in ["build.gradle", "build.gradle.kts"]:
-        gf = module_root / gradle_file
-        if gf.exists():
-            try:
-                content = gf.read_text(encoding="utf-8", errors="replace")
-                m = re.search(r'sourceCompatibility\s*[= ]\s*["\']?1\.(\d+)["\']?', content)
-                if m:
-                    return (int(m.group(1)), None)
-                m = re.search(r'sourceCompatibility\s*[= ]\s*["\']?(\d+)["\']?', content)
-                if m:
-                    return (int(m.group(1)), None)
-                m = re.search(r'JavaVersion\.VERSION_1_(\d+)', content)
-                if m:
-                    return (int(m.group(1)), None)
-                m = re.search(r'JavaVersion\.VERSION_(\d+)', content)
-                if m:
-                    return (int(m.group(1)), None)
-            except Exception:
-                pass
+    # Gradle: 检查 sourceCompatibility（在模块及父目录查找，最多 6 层）
+    for _ in range(6):
+        for gradle_file in ["build.gradle", "build.gradle.kts"]:
+            gf = module_root / gradle_file
+            if gf.exists():
+                try:
+                    content = gf.read_text(encoding="utf-8", errors="replace")
+                    m = re.search(r'sourceCompatibility\s*[= ]\s*["\']?1\.(\d+)["\']?', content)
+                    if m:
+                        return (int(m.group(1)), None)
+                    m = re.search(r'sourceCompatibility\s*[= ]\s*["\']?(\d+)["\']?', content)
+                    if m:
+                        return (int(m.group(1)), None)
+                    m = re.search(r'JavaVersion\.VERSION_1_(\d+)', content)
+                    if m:
+                        return (int(m.group(1)), None)
+                    m = re.search(r'JavaVersion\.VERSION_(\d+)', content)
+                    if m:
+                        return (int(m.group(1)), None)
+                except Exception:
+                    pass
+        module_root = module_root.parent
 
     return None
 
 
-JDK_SKIP_MSG = "JDK mismatch: project requires {req}, current is JDK {cur}"
+JDK_SKIP_MSG = "JDK mismatch: project requires {req}, no compatible JDK found (current: JDK {cur})"
+
+# 缓存已安装 JDK 列表: {major_version: path}
+_jdk_cache: Optional[Dict[int, str]] = None
+
+
+def _list_installed_jdks() -> Dict[int, str]:
+    """扫描已安装 JDK，返回 {major_version: JAVA_HOME_path}。"""
+    global _jdk_cache
+    if _jdk_cache is not None:
+        return _jdk_cache
+    jdks: Dict[int, str] = {}
+    sdkman_java = Path.home() / ".sdkman" / "candidates" / "java"
+    for candidate in [sdkman_java]:
+        if not candidate.exists():
+            continue
+        for d in candidate.iterdir():
+            if not d.is_dir() or d.name == "current":
+                continue
+            m = re.match(r"(\d+)\.", d.name)
+            if m and int(m.group(1)) > 4:
+                jdks[int(m.group(1))] = str(d)
+            # 兼容 JRE 目录命名: jre-1.8.0_xxx
+            m = re.match(r"jre-1\.(\d+)", d.name)
+            if m:
+                jdks[int(m.group(1))] = str(d)
+    _jdk_cache = jdks
+    return jdks
+
+
+def _find_jdk_for_range(jdk_min: int, jdk_max: Optional[int]) -> Optional[str]:
+    """在已安装 JDK 中找匹配 [min, max] 的最高版本，返回 JAVA_HOME 路径。"""
+    installed = _list_installed_jdks()
+    candidates = []
+    for ver in sorted(installed.keys()):
+        if ver < jdk_min:
+            continue
+        if jdk_max is not None and ver > jdk_max:
+            continue
+        candidates.append(ver)
+    if candidates:
+        # 取符合条件中最高版本
+        return installed[max(candidates)]
+    return None
+
+
+def _is_android_project(module_root: Path) -> bool:
+    """检测 Gradle 模块是否为 Android 项目（application 或 library）。"""
+    for build_file in ("build.gradle", "build.gradle.kts"):
+        bf = module_root / build_file
+        if bf.exists():
+            content = bf.read_text(encoding="utf-8", errors="ignore")
+            if "com.android.application" in content or "com.android.library" in content:
+                return True
+    return False
+
+
+def _find_android_sdk() -> Optional[Path]:
+    """查找系统中已安装的 Android SDK 路径。"""
+    # 1. 环境变量
+    for env_var in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
+        p = os.environ.get(env_var)
+        if p and Path(p).exists():
+            return Path(p)
+    # 2. 常见默认路径
+    candidates = [
+        Path.home() / "Android" / "Sdk",
+        Path("/usr/local/android-sdk"),
+        Path("/opt/android-sdk"),
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+
+def _run_gradle_compile(module_root: Path, base_env: dict,
+                        task: str = "compileJava") -> subprocess.CompletedProcess:
+    """运行 gradle 编译 task，优先用项目 gradlew，自动解决 task 歧义、JDK 降级。"""
+    gw = _find_gradlew(module_root)
+    if gw:
+        gw = gw.resolve()
+        gw.chmod(0o755)
+
+    def _make_cmd(t: str) -> list:
+        exe = [str(gw)] if gw else ["gradle"]
+        return exe + [t, "--no-daemon"]
+
+    def _run(cmd: list, env: dict) -> subprocess.CompletedProcess:
+        try:
+            return subprocess.run(
+                cmd, cwd=str(module_root), capture_output=True, text=True, timeout=300,
+                env=env,
+            )
+        except FileNotFoundError:
+            return subprocess.CompletedProcess(cmd, -1, stdout="", stderr=f"executable not found: {cmd[0]}")
+
+    def _resolve_ambiguous(proc: subprocess.CompletedProcess) -> Optional[str]:
+        """从 'Task X is ambiguous' 错误中提取第一个可行的具体 task。
+        优先选含 Release 且不含 Test/AndroidTest 的 task。"""
+        merged = proc.stderr + proc.stdout
+        if "is ambiguous" not in merged:
+            return None
+        import re as _re
+        m = _re.search(r"Candidates are:\s*(.+)", merged, _re.DOTALL)
+        if not m:
+            return None
+        cands = _re.findall(r"'(\w+)'", m.group(1))
+        # 优先：含 Release 且不含 Test/AndroidTest
+        for c in cands:
+            if "release" in c.lower() and "test" not in c.lower() and "androidtest" not in c.lower():
+                return c
+        # 回退：含 Compile/Java 但不是测试
+        for c in cands:
+            if "compile" in c.lower() and "test" not in c.lower() and "androidtest" not in c.lower():
+                return c
+        return None
+
+    def _needs_jdk_fallback(proc: subprocess.CompletedProcess) -> bool:
+        if proc.returncode == 0:
+            return False
+        merged = proc.stderr + proc.stdout
+        return any(kw in merged for kw in ("ScriptPluginFactory", "BuildScopeServices",
+                                            "dependencyResolutionManagement",
+                                            "Could not create service"))
+
+    def _try_jdk_fallback(cmd: list, env: dict) -> subprocess.CompletedProcess:
+        fallback_jdk = _find_jdk_for_range(8, 11)
+        if fallback_jdk:
+            fb_env = env.copy()
+            fb_env["JAVA_HOME"] = fallback_jdk
+            fb_env["PATH"] = f"{fallback_jdk}/bin:{fb_env['PATH']}"
+            LOGGER.info("  Gradle JDK fallback: trying %s", fallback_jdk)
+            return _run(cmd, fb_env)
+        return subprocess.CompletedProcess(cmd, -1, stdout="", stderr="JDK fallback: no compatible JDK found")
+
+    cmd = _make_cmd(task)
+    proc = _run(cmd, base_env)
+
+    if _needs_jdk_fallback(proc):
+        proc = _try_jdk_fallback(cmd, base_env)
+
+    # Task 歧义：从错误信息中自动选择具体 task
+    resolved = _resolve_ambiguous(proc)
+    if resolved:
+        LOGGER.info("  Gradle task resolved: %s → %s", task, resolved)
+        cmd2 = _make_cmd(resolved)
+        proc = _run(cmd2, base_env)
+        if _needs_jdk_fallback(proc):
+            proc = _try_jdk_fallback(cmd2, base_env)
+
+    return proc
+
+
+def _find_gradlew(module_root: Path) -> Optional[Path]:
+    """向上搜索 gradlew。"""
+    d = module_root
+    for _ in range(6):
+        gw = d / "gradlew"
+        if gw.exists():
+            return gw
+        d = d.parent
+    return None
 
 
 def check_compilability(repo_path: Path, modified_files: List[str]) -> Tuple[str, str]:
@@ -1024,34 +1311,39 @@ def check_compilability(repo_path: Path, modified_files: List[str]) -> Tuple[str
             continue
         checked_modules.add(str(module_root))
 
-        # 检测 JDK 版本是否匹配项目要求
+        # 确定该模块使用的 JDK
+        env = os.environ.copy()
+        jdk_home = None
         req_jdk = _parse_required_java_version(module_root)
         if current_jdk and req_jdk:
             jdk_min, jdk_max = req_jdk
-            if current_jdk < jdk_min:
-                msg = JDK_SKIP_MSG.format(req=f">= {jdk_min}", cur=current_jdk)
-                results.append("skipped")
-                errors.append(msg)
-                LOGGER.warning("  %s / %s: %s", repo_path.name, module_root.name, msg)
-                continue
-            if jdk_max is not None and current_jdk > jdk_max:
-                msg = JDK_SKIP_MSG.format(req=f"[{jdk_min}, {jdk_max}]", cur=current_jdk)
-                results.append("skipped")
-                errors.append(msg)
-                LOGGER.warning("  %s / %s: %s", repo_path.name, module_root.name, msg)
-                continue
+            if current_jdk < jdk_min or (jdk_max is not None and current_jdk > jdk_max):
+                jdk_home = _find_jdk_for_range(jdk_min, jdk_max)
+                if jdk_home is None:
+                    req_desc = (f">= {jdk_min}" if jdk_max is None
+                                else f"[{jdk_min}, {jdk_max}]")
+                    msg = JDK_SKIP_MSG.format(req=req_desc, cur=current_jdk)
+                    results.append("skipped")
+                    errors.append(msg)
+                    LOGGER.warning("  %s / %s: %s", repo_path.name, module_root.name, msg)
+                    continue
+                env["JAVA_HOME"] = jdk_home
+                env["PATH"] = f"{jdk_home}/bin:{env['PATH']}"
+                LOGGER.info("  %s / %s: JDK %d → %s", repo_path.name, module_root.name, current_jdk, jdk_home)
 
         if (module_root / "pom.xml").exists():
             LOGGER.info("Compiling Maven module: %s", module_root)
             try:
                 proc = subprocess.run(
                     [_find_mvn(), "compile", "-q"],
-                    cwd=str(module_root), capture_output=True, text=True, timeout=120
+                    cwd=str(module_root), capture_output=True, text=True, timeout=300,
+                    env=env,
                 )
                 if proc.returncode == 0:
                     results.append("yes")
                 else:
-                    errors.append(f"Maven {module_root}: {proc.stderr[-500:]}")
+                    err_text = (proc.stderr + proc.stdout)[-2000:]
+                    errors.append(f"Maven {module_root}: {err_text}")
                     results.append("no")
             except FileNotFoundError:
                 results.append("skipped")
@@ -1061,15 +1353,41 @@ def check_compilability(repo_path: Path, modified_files: List[str]) -> Tuple[str
                 errors.append("mvn timeout")
         elif (module_root / "build.gradle").exists() or (module_root / "build.gradle.kts").exists():
             LOGGER.info("Compiling Gradle module: %s", module_root)
+            is_android = _is_android_project(module_root)
+            # Android 项目 compileJava 有歧义，用 release variant task
+            gradle_task = "compileReleaseJavaWithJavac" if is_android else "compileJava"
+            # Android 项目需要 ANDROID_HOME；同时写 local.properties 作为备用
+            if is_android and "ANDROID_HOME" not in env:
+                sdk_dir = _find_android_sdk()
+                if sdk_dir:
+                    env["ANDROID_HOME"] = str(sdk_dir)
+                    env["PATH"] = f"{sdk_dir}/cmdline-tools/latest/bin:{env['PATH']}"
+                    # 同时写 local.properties，gradle 某些版本主要看这个
+                    lp = module_root
+                    for _ in range(6):
+                        lp_file = lp / "local.properties"
+                        if lp_file.exists():
+                            break
+                        lp = lp.parent
+                    else:
+                        # 尝试写到 repo 根目录
+                        lp_file = Path(module_root)
+                        for _ in range(6):
+                            if (lp_file / "build.gradle").exists() or (lp_file / "build.gradle.kts").exists():
+                                break
+                            lp_file = lp_file.parent
+                        else:
+                            lp_file = Path(module_root)
+                        lp_file = lp_file / "local.properties"
+                    if not lp_file.exists():
+                        lp_file.write_text(f"sdk.dir={sdk_dir}\n")
             try:
-                proc = subprocess.run(
-                    ["gradle", "compileJava"],
-                    cwd=str(module_root), capture_output=True, text=True, timeout=120
-                )
+                proc = _run_gradle_compile(module_root, env, task=gradle_task)
                 if proc.returncode == 0:
                     results.append("yes")
                 else:
-                    errors.append(f"Gradle {module_root}: {proc.stderr[-500:]}")
+                    err_text = (proc.stderr + proc.stdout)[-2000:]
+                    errors.append(f"Gradle {module_root}: {err_text}")
                     results.append("no")
             except FileNotFoundError:
                 results.append("skipped")
@@ -1091,7 +1409,8 @@ def check_compilability(repo_path: Path, modified_files: List[str]) -> Tuple[str
             if proc.returncode == 0:
                 results.append("yes")
             else:
-                errors.append(f"Python {pf}: {proc.stderr[-300:]}")
+                err_text = (proc.stderr + proc.stdout)[-2000:]
+                errors.append(f"Python {pf}: {err_text}")
                 results.append("no")
         except FileNotFoundError:
             results.append("skipped")
@@ -1105,9 +1424,9 @@ def check_compilability(repo_path: Path, modified_files: List[str]) -> Tuple[str
     if all(r == "yes" for r in results):
         return "yes", ""
     elif all(r == "no" for r in results):
-        return "no", " | ".join(errors[:3])
+        return "no", " | ".join(errors)
     else:
-        return "partial", " | ".join(errors[:3])
+        return "partial", " | ".join(errors)
 
 
 # ===================================================================
@@ -1135,8 +1454,11 @@ def run_phase4(
     dry_run: bool = False,
     repo_limit: int = 0,
     workers: int = 5,
+    repo_workers: int = 1,
 ) -> pd.DataFrame:
-    """Phase 4 主入口。"""
+    """Phase 4 主入口。
+
+    repo_workers: 同时处理的 repo 数量（默认 1，串行）。设为 >1 时多个 repo 并行克隆/分析/编译。"""
     # 从 DB 加载 CVE 描述
     conn = sqlite3.connect(vuln_db_path)
     conn.row_factory = sqlite3.Row
@@ -1160,15 +1482,46 @@ def run_phase4(
 
     LOGGER.info("Total unique repo*Tag combinations to process: %d", len(unique_repos))
 
-    result_rows = []
-    repo_processed = 0
+    # ---- 断点续传：加载已有进度，跳过已处理的 (repo, tag) ----
+    progress_path = cache_dir / "_vuln_injection_progress.json"
+    processed_keys: set = set()
+    result_rows: List[dict] = []
+    repo_processed_base = 0
 
-    for _, repo_row in unique_repos.iterrows():
-        repo_name = str(repo_row["RepoName"])
-        tag = str(repo_row["Tag"])
-        repo_processed += 1
+    if progress_path.exists():
+        try:
+            existing = json.loads(progress_path.read_text(encoding="utf-8"))
+            if isinstance(existing, list) and existing:
+                result_rows = existing
+                for row in existing:
+                    processed_keys.add((str(row.get("RepoName", "")), str(row.get("Tag", ""))))
+                LOGGER.info("Resume: loaded %d existing results, %d unique (repo, tag) already processed",
+                            len(existing), len(processed_keys))
+        except Exception as exc:
+            LOGGER.warning("Failed to load progress file, starting fresh: %s", exc)
+            result_rows = []
 
-        LOGGER.info("[%d/%d] Processing repo: %s @ %s", repo_processed, len(unique_repos), repo_name, tag)
+    total_repos = len(unique_repos) + len(processed_keys)
+    if processed_keys:
+        mask = unique_repos.apply(lambda r: (str(r["RepoName"]), str(r["Tag"])) not in processed_keys, axis=1)
+        unique_repos = unique_repos[mask]
+        repo_processed_base = len(processed_keys)
+        LOGGER.info("After resume filter: %d remaining to process", len(unique_repos))
+
+    # 线程安全锁（repo 级并行时保护 result_rows 和进度文件）
+    result_lock = threading.Lock()
+    counter_lock = threading.Lock()
+    next_repo_idx = [repo_processed_base + 1]
+
+    def _process_one_repo(repo_name: str, tag: str) -> List[dict]:
+        """处理单个 repo 的所有 CVE（Phase A → B → C），返回该 repo 的结果行列表。"""
+        with counter_lock:
+            repo_idx = next_repo_idx[0]
+            next_repo_idx[0] += 1
+
+        LOGGER.info("[%d/%d] Processing repo: %s @ %s", repo_idx, total_repos, repo_name, tag)
+
+        repo_results: List[dict] = []
 
         # 1. 克隆
         repo_path = clone_repo(repo_name, tag, cache_dir)
@@ -1177,7 +1530,7 @@ def run_phase4(
             repo_matches = match_df[(match_df["RepoName"] == repo_name) & (match_df["Tag"] == tag)]
             for _, match in repo_matches.iterrows():
                 cp_info = _checkpoint_info(checkpoints_map.get(str(match["CVE"])))
-                result_rows.append({
+                repo_results.append({
                     "RepoName": repo_name, "Tag": tag,
                     "Component": str(match["Component"]),
                     "UsedVersion": str(match["UsedVersion"]),
@@ -1190,25 +1543,40 @@ def run_phase4(
                     "Status": "clone_failed",
                     **cp_info,
                 })
-            continue
+            return repo_results
 
-        # 2. 获取该 repo 的所有 CVE
+        # 2. 确认 repo 干净
+        _ensure_clean_repo(repo_path, tag)
+
+        # 3. 获取该 repo 的所有 CVE
         repo_matches = match_df[(match_df["RepoName"] == repo_name) & (match_df["Tag"] == tag)]
 
-        # ---- Phase A: 串行发现调用点（快速 grep + AST）----
-        tasks: List[dict] = []  # 需要 LLM 分析的 CVE
-        for _, match in repo_matches.iterrows():
+        # ---- Phase A: 并行发现调用点 ----
+        tasks: List[dict] = []
+        t_matches = list(repo_matches.iterrows())
+
+        def _find_sites(_, match):
             component = str(match["Component"])
             used_version = str(match["UsedVersion"])
             vuln_version = str(match.get("VulnerableVersion", "") or "")
             source_file = str(match.get("SourceFile", ""))
             cve_id = str(match["CVE"])
             determination = str(match.get("Determination", ""))
-
             call_sites = find_call_sites(repo_path, component, source_file)
+            return match, component, used_version, vuln_version, cve_id, determination, call_sites
+
+        a_workers = min(len(t_matches), workers) if workers > 0 else min(len(t_matches), 5)
+        a_results: List[tuple] = []
+        if t_matches:
+            with ThreadPoolExecutor(max_workers=a_workers) as a_executor:
+                a_futures = {a_executor.submit(_find_sites, idx, m): idx for idx, m in t_matches}
+                for future in as_completed(a_futures):
+                    a_results.append(future.result())
+
+        for _, component, used_version, vuln_version, cve_id, determination, call_sites in a_results:
             if not call_sites:
                 cp_info = _checkpoint_info(checkpoints_map.get(cve_id))
-                result_rows.append({
+                repo_results.append({
                     "RepoName": repo_name, "Tag": tag,
                     "Component": component, "UsedVersion": used_version,
                     "CVE": cve_id, "VulnerableVersion": vuln_version,
@@ -1225,19 +1593,18 @@ def run_phase4(
             description = desc_map.get(cve_id, "")
             checkpoints = checkpoints_map.get(cve_id)
             tasks.append({
-                "match": match, "component": component, "used_version": used_version,
+                "component": component, "used_version": used_version,
                 "vuln_version": vuln_version, "cve_id": cve_id,
                 "determination": determination, "call_sites": call_sites,
                 "description": description, "checkpoints": checkpoints,
             })
 
-        # ---- Phase B: 并行 LLM 分析（主力加速点）----
+        # ---- Phase B: 并行 LLM 分析 ----
         if tasks:
             log_dir = cache_dir / "llm_logs"
             max_workers = min(len(tasks), workers) if workers > 0 else min(len(tasks), 5)
 
             def _llm_task(task):
-                """单个 LLM 分析任务（在线程池中执行）"""
                 analysis = analyze_vulnerability_pattern(
                     base_url, api_key, model,
                     task["component"], task["used_version"], task["vuln_version"],
@@ -1250,14 +1617,13 @@ def run_phase4(
             LOGGER.info("  Submitting %d LLM tasks with %d workers...", len(tasks), max_workers)
             analysis_results: List[dict] = []
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {executor.submit(_llm_task, t): i for i, t in enumerate(tasks)}
-                for i, future in enumerate(as_completed(futures), 1):
+                b_futures = {executor.submit(_llm_task, t): i for i, t in enumerate(tasks)}
+                for i, future in enumerate(as_completed(b_futures), 1):
                     result = future.result()
                     analysis_results.append(result)
                     cve = result["cve_id"]
                     status = result["analysis"].get("status", "") if result["analysis"] else "llm_failed"
                     LOGGER.info("  [%d/%d] LLM done: %s -> %s", i, len(tasks), cve, status)
-
         else:
             analysis_results = []
 
@@ -1271,22 +1637,25 @@ def run_phase4(
             analysis = task["analysis"]
             cp_info = _checkpoint_info(task.get("checkpoints"))
 
+            # 使用默认参数值绑定闭包变量（避免并行时串值）
             def _row(status, modified_files="", patch_file="", injection_summary="",
-                     compilable="skipped", compile_error="", reason=""):
+                     compilable="skipped", compile_error="", reason="",
+                     _rn=repo_name, _t=tag, _c=component, _uv=used_version,
+                     _cv=cve_id, _vv=vuln_version, _d=determination, _cp=cp_info):
                 return {
-                    "RepoName": repo_name, "Tag": tag,
-                    "Component": component, "UsedVersion": used_version,
-                    "CVE": cve_id, "VulnerableVersion": vuln_version,
-                    "Determination": determination,
+                    "RepoName": _rn, "Tag": _t,
+                    "Component": _c, "UsedVersion": _uv,
+                    "CVE": _cv, "VulnerableVersion": _vv,
+                    "Determination": _d,
                     "ModifiedFiles": modified_files, "PatchFile": patch_file,
                     "InjectionSummary": injection_summary, "Reason": reason,
                     "Compilable": compilable, "CompileError": compile_error,
                     "Status": status,
-                    **cp_info,
+                    **_cp,
                 }
 
             if analysis is None:
-                result_rows.append(_row("llm_failed", injection_summary="LLM analysis failed"))
+                repo_results.append(_row("llm_failed", injection_summary="LLM analysis failed"))
                 continue
 
             status = analysis.get("status", "")
@@ -1297,7 +1666,7 @@ def run_phase4(
             api_text = injection_summary or f"API: {vulnerable_api}"
 
             if status == "already_vulnerable":
-                result_rows.append(_row(
+                repo_results.append(_row(
                     "already_vulnerable",
                     injection_summary=analysis.get("already_vulnerable_details", injection_summary),
                     reason=reason,
@@ -1305,43 +1674,67 @@ def run_phase4(
                 continue
 
             if status == "not_injectable":
-                result_rows.append(_row("no_injection_possible", injection_summary=api_text, reason=reason))
+                repo_results.append(_row("no_injection_possible", injection_summary=api_text, reason=reason))
                 continue
 
             if status == "injectable":
                 if not modifications:
-                    result_rows.append(_row("no_injection_possible", injection_summary=api_text, reason=reason))
+                    repo_results.append(_row("no_injection_possible", injection_summary=api_text, reason=reason))
                     continue
 
-                # 4. 应用修改
+                modified_files = apply_injections(repo_path, modifications)
                 if dry_run:
-                    modified_files = [m.get("file", "") for m in modifications]
-                    compilable, compile_error, patch_file = "skipped", "dry_run", ""
+                    compilable, compile_error = "skipped", "dry_run"
                 else:
-                    modified_files = apply_injections(repo_path, modifications)
-                    # 5. 编译检查
                     compilable, compile_error = check_compilability(repo_path, modified_files)
-                    # 6. 保存 patch + 恢复仓库
-                    patch_file = _save_patch_and_restore(repo_path, cache_dir / "patches", cve_id, repo_name) or ""
+                patch_file = _save_patch_and_restore(repo_path, cache_dir / "patches", cve_id, repo_name, tag) or ""
 
                 if not modified_files:
-                    result_rows.append(_row("injection_failed", injection_summary=injection_summary, reason=reason))
+                    repo_results.append(_row("injection_failed", injection_summary=injection_summary, reason=reason))
                 else:
                     modified_files_str = ", ".join(modified_files)
-                    result_rows.append(_row(
+                    repo_results.append(_row(
                         "injected", modified_files=modified_files_str,
                         patch_file=patch_file, injection_summary=injection_summary,
                         compilable=compilable, compile_error=compile_error, reason=reason,
                     ))
                 continue
 
-            # 未知 status
-            result_rows.append(_row("no_injection_possible", injection_summary=api_text, reason=reason))
+            repo_results.append(_row("no_injection_possible", injection_summary=api_text, reason=reason))
 
-        # 保存中间结果（每处理完一个 repo）
-        if result_rows:
-            progress_path = cache_dir / "_vuln_injection_progress.json"
-            progress_path.write_text(json.dumps(result_rows, indent=2, ensure_ascii=False), encoding="utf-8")
+        return repo_results
+
+    # ---- 主循环：repo 级并行 ----
+    repo_items = [(str(r["RepoName"]), str(r["Tag"])) for _, r in unique_repos.iterrows()]
+    if repo_items:
+        rw = max(1, repo_workers) if repo_workers > 0 else 1
+        with ThreadPoolExecutor(max_workers=rw) as r_executor:
+            r_futures = {r_executor.submit(_process_one_repo, rn, tg): (rn, tg) for rn, tg in repo_items}
+            for future in as_completed(r_futures):
+                rn, tg = r_futures[future]
+                try:
+                    repo_results = future.result()
+                except Exception as exc:
+                    LOGGER.error("Repo %s @ %s failed with exception: %s", rn, tg, exc)
+                    repo_results = [{
+                        "RepoName": rn, "Tag": tg,
+                        "Component": "", "UsedVersion": "", "CVE": "", "VulnerableVersion": "",
+                        "Determination": "", "ModifiedFiles": "", "PatchFile": "",
+                        "InjectionSummary": str(exc), "Reason": "",
+                        "Compilable": "skipped", "CompileError": "",
+                        "Status": "error", "Checkpoint": "{}",
+                    }]
+                with result_lock:
+                    result_rows.extend(repo_results)
+                    if result_rows:
+                        progress_path.write_text(json.dumps(result_rows, indent=2, ensure_ascii=False), encoding="utf-8")
+                        # 同步输出 inject 成功的结果
+                        injected_rows = [r for r in result_rows if r.get("Status") == "injected"]
+                        if injected_rows:
+                            injected_path = cache_dir / "_vuln_injection_progress_injected.json"
+                            injected_path.write_text(json.dumps(injected_rows, indent=2, ensure_ascii=False), encoding="utf-8")
+    else:
+        LOGGER.info("No repos to process")
 
     if result_rows:
         df = pd.DataFrame(result_rows)
@@ -1378,6 +1771,8 @@ def parse_args() -> argparse.Namespace:
                         help="限制处理的 repo 数量（0=全部）")
     parser.add_argument("--workers", type=int, default=5,
                         help="并行 LLM 调用数（默认 5）")
+    parser.add_argument("--repo-workers", type=int, default=1,
+                        help="同时处理的 repo 数量（默认 1，串行）")
     return parser.parse_args()
 
 
@@ -1401,11 +1796,21 @@ def main() -> None:
         dry_run=args.dry_run,
         repo_limit=args.repo_limit,
         workers=args.workers,
+        repo_workers=args.repo_workers,
     )
     output_path = Path(args.output) if args.output else Path("result") / f"vuln_injection_result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(result_df.to_dict(orient="records"), indent=2, ensure_ascii=False), encoding="utf-8")
     LOGGER.info("Phase 4 output written to %s (%d rows)", output_path, len(result_df))
+
+    # 注入成功的单独输出一份
+    if not result_df.empty:
+        injected_df = result_df[result_df["Status"] == "injected"]
+        if not injected_df.empty:
+            stem = output_path.stem  # e.g. "vuln_injection_result_20250617_120000"
+            injected_path = output_path.parent / f"{stem}_injected.json"
+            injected_path.write_text(json.dumps(injected_df.to_dict(orient="records"), indent=2, ensure_ascii=False), encoding="utf-8")
+            LOGGER.info("Injected-only output written to %s (%d rows)", injected_path, len(injected_df))
 
     # 统计
     if not result_df.empty:
