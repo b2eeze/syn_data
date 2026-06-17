@@ -6,6 +6,5 @@ __pycache__/
 repos_cache/
 workflow_cache/
 .env
-# SQLite DBs are large, keep one copy
 # vuln_ruler_filtered.db
 vuln_ruler.db
