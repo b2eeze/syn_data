@@ -2,10 +2,8 @@
 """
 Phase 1: 依赖提取 — 从 GitHub 仓库中扫描依赖文件，提取目标组件版本
 
-CVE 输入: 从 uncovered_library_cves.xlsx 读取 target + cve_list，按 top-k 筛选
-
 用法:
-    python dep_analyzer.py --github-token ghp_xxx [--top-tags 3] [--repo-limit 5] [--top-k 10]
+    python dep_analyzer.py --github-token ghp_xxx [--top-tags 3] [--repo-limit 5]
 """
 
 import argparse
@@ -14,8 +12,10 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -607,27 +607,6 @@ def deduplicate_rows(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
     return result
 
 
-def load_cves_from_excel(excel_path: str, top_k: Optional[int] = None) -> Dict[str, List[str]]:
-    """从 uncovered_library_cves.xlsx 读取每个 target 的 CVE 列表，按 top-k 截取。
-    返回 {target_name: [cve_id, ...]}
-    """
-    df = pd.read_excel(excel_path)
-    cve_map: Dict[str, List[str]] = {}
-    for _, row in df.iterrows():
-        target_name = str(row["target_name"]).strip()
-        cve_list_str = str(row.get("cve_list", ""))
-        if not cve_list_str or cve_list_str.lower() == "nan":
-            cve_map[target_name] = []
-            continue
-        cves = [c.strip() for c in cve_list_str.split(",") if c.strip().upper().startswith("CVE-")]
-        if top_k and top_k > 0:
-            cves = cves[:top_k]
-        cve_map[target_name] = cves
-    LOGGER.info("Loaded %d targets from %s, total CVEs=%d",
-                len(cve_map), excel_path, sum(len(v) for v in cve_map.values()))
-    return cve_map
-
-
 def load_repos_from_excel(excel_path: str) -> List[Dict[str, str]]:
     """从 Excel 读取仓库列表，格式: RepoName (owner/repo)"""
     df = pd.read_excel(excel_path)
@@ -645,35 +624,61 @@ def load_repos_from_excel(excel_path: str) -> List[Dict[str, str]]:
     return repos
 
 
+def _process_repo(repo_info: Dict[str, str], comp_lookup: Dict, headers: Dict[str, str],
+                  top_tags: int, idx: int, total: int, lock: threading.Lock) -> List[Dict[str, str]]:
+    """处理单个仓库（线程安全）"""
+    owner, repo, repo_name = repo_info["owner"], repo_info["repo"], repo_info["repo_name"]
+    with lock:
+        LOGGER.info("[%d/%d] Processing repo: %s/%s", idx, total, owner, repo)
+
+    rows: List[Dict[str, str]] = []
+    tags = list_recent_tags(owner, repo, top_tags, headers)
+    if not tags:
+        with lock:
+            LOGGER.warning("[%d/%d] No tags found for %s/%s", idx, total, owner, repo)
+        return rows
+
+    for tag in tags:
+        try:
+            hits = scan_repo_for_deps(owner, repo, tag, headers, comp_lookup)
+            for row in hits:
+                row["RepoName"] = repo_name
+            rows.extend(hits)
+            with lock:
+                LOGGER.info("[%d/%d] Repo %s tag %s: %d hits", idx, total, repo_name, tag, len(hits))
+        except Exception as exc:
+            with lock:
+                LOGGER.warning("[%d/%d] Failed to scan %s tag %s: %s", idx, total, repo_name, tag, exc)
+    return rows
+
+
 def run(repos: List[Dict[str, str]], comp_lookup: Dict, headers: Dict[str, str],
-        top_tags: int, repo_limit: int) -> pd.DataFrame:
-    """主入口：扫描所有仓库，提取依赖"""
-    all_rows: List[Dict[str, str]] = []
+        top_tags: int, repo_limit: int, workers: int = 5) -> pd.DataFrame:
+    """主入口：并发扫描所有仓库，提取依赖"""
     repos_to_scan = repos[:repo_limit] if repo_limit and repo_limit > 0 else repos
     total = len(repos_to_scan)
+    all_rows: List[Dict[str, str]] = []
+    lock = threading.Lock()
 
-    for i, repo_info in enumerate(repos_to_scan):
-        owner, repo, repo_name = repo_info["owner"], repo_info["repo"], repo_info["repo_name"]
-        LOGGER.info("[%d/%d] Processing repo: %s/%s", i + 1, total, owner, repo)
-        tags = list_recent_tags(owner, repo, top_tags, headers)
-        if not tags:
-            LOGGER.warning("[%d/%d] No tags found for %s/%s", i + 1, total, owner, repo)
-            continue
-        for tag in tags:
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {}
+        for i, repo_info in enumerate(repos_to_scan, 1):
+            future = executor.submit(_process_repo, repo_info, comp_lookup, headers, top_tags, i, total, lock)
+            futures[future] = repo_info["repo_name"]
+
+        for future in as_completed(futures):
+            repo_name = futures[future]
             try:
-                rows = scan_repo_for_deps(owner, repo, tag, headers, comp_lookup)
-                for row in rows:
-                    row["RepoName"] = repo_name
+                rows = future.result()
                 all_rows.extend(rows)
-                LOGGER.info("[%d/%d] Repo %s tag %s: %d hits", i + 1, total, repo_name, tag, len(rows))
             except Exception as exc:
-                LOGGER.warning("[%d/%d] Failed to scan %s tag %s: %s", i + 1, total, repo_name, tag, exc)
+                LOGGER.error("Repo %s failed with error: %s", repo_name, exc)
 
     if all_rows:
         df = pd.DataFrame(all_rows, columns=["RepoName", "Tag", "Component", "Version", "SourceFile"])
     else:
         df = pd.DataFrame(columns=["RepoName", "Tag", "Component", "Version", "SourceFile"])
-    LOGGER.info("Phase 1 complete: %d total hits", len(df))
+    LOGGER.info("Phase 1 complete: %d total hits from %d repos (workers=%d)", len(df), total, workers)
     return df
 
 
@@ -686,10 +691,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--github-token", default="", help="GitHub API Token（必需）")
     parser.add_argument("--top-tags", type=int, default=0, help="每个仓库分析的 tag 数量 (0=全部)")
     parser.add_argument("--repo-limit", type=int, default=0, help="限制分析的仓库数量 (0=全部)")
+    parser.add_argument("--workers", type=int, default=5, help="并发 worker 数 (默认 5)")
     parser.add_argument("--cache-dir", default=str(DEFAULT_CACHE_DIR), help="本地缓存目录")
     parser.add_argument("--repos-excel", default="data/github_top_repos.xlsx", help="仓库列表 Excel")
-    parser.add_argument("--cve-input", default="data/uncovered_library_cves.xlsx", help="CVE 输入文件（含 target_name + cve_list）")
-    parser.add_argument("--top-k", type=int, default=0, help="每个 target 选取的 CVE 数量 (0=全部)")
     parser.add_argument("--vuln-db", default="vuln_ruler.db", help="漏洞数据库路径（读取 targets）")
     parser.add_argument("--output", default="data/dep_scan_result.xlsx", help="输出文件路径")
     return parser.parse_args()
@@ -704,41 +708,17 @@ def main() -> None:
 
     headers = build_headers(args.github_token)
 
-    # 1. 加载 uncovered CVE 列表
-    top_k = args.top_k if args.top_k > 0 else None
-    cve_map = load_cves_from_excel(args.cve_input, top_k)
-    uncovered_target_names = set(cve_map.keys())
-    LOGGER.info("Uncovered targets: %d (top_k=%s)", len(uncovered_target_names), top_k or "all")
-
-    # 2. 从 vuln_ruler.db 加载 targets，仅保留 uncovered 中的
     LOGGER.info("Loading targets from %s", args.vuln_db)
-    all_targets = load_targets_from_db(args.vuln_db)
-    targets = [t for t in all_targets if t["name"] in uncovered_target_names]
-    LOGGER.info("Filtered targets: %d/%d (java=%d, python=%d, cve_scope=%d CVEs)",
-                len(targets), len(all_targets),
-                sum(1 for t in targets if (t.get("language") or "").lower() == "java"),
-                sum(1 for t in targets if (t.get("language") or "").lower() == "python"),
-                sum(len(cve_map.get(t["name"], [])) for t in targets))
-
+    targets = load_targets_from_db(args.vuln_db)
     comp_lookup = build_component_lookup(targets)
+    LOGGER.info("Loaded %d targets: java=%d, python=%d",
+                len(targets), len(comp_lookup["java_targets"]), len(comp_lookup["python_targets"]))
 
-    # 3. 依赖扫描
     LOGGER.info("==== Phase 1: Dependency Extraction ====")
     repos = load_repos_from_excel(args.repos_excel)
-    dep_df = run(repos, comp_lookup, headers, args.top_tags, args.repo_limit)
-
-    # 4. 写入 Excel（两个 sheet: DepScan + CVEScope）
-    cve_scope_rows: List[Dict[str, str]] = []
-    for t in targets:
-        for cve_id in cve_map.get(t["name"], []):
-            cve_scope_rows.append({"Component": t["name"], "CVE": cve_id})
-    cve_scope_df = pd.DataFrame(cve_scope_rows, columns=["Component", "CVE"])
-
-    with pd.ExcelWriter(args.output, engine="openpyxl") as writer:
-        dep_df.to_excel(writer, sheet_name="DepScan", index=False)
-        cve_scope_df.to_excel(writer, sheet_name="CVEScope", index=False)
-    LOGGER.info("Output written to %s: DepScan=%d rows, CVEScope=%d rows",
-                args.output, len(dep_df), len(cve_scope_df))
+    dep_df = run(repos, comp_lookup, headers, args.top_tags, args.repo_limit, args.workers)
+    dep_df.to_excel(args.output, index=False)
+    LOGGER.info("Output written to %s (%d rows)", args.output, len(dep_df))
 
 
 if __name__ == "__main__":

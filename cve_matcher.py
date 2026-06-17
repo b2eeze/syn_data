@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
-Phase 3: 双向匹配 — 将 Phase 1 的依赖版本与 Phase 2 的 CVE 有漏洞版本进行匹配
+Phase 3: 版本匹配 — 将 Phase 1 的依赖版本与 Phase 2 的 CVE 有漏洞版本进行匹配
+
+匹配策略：
+  1. 组件名匹配（归一化后相互包含）
+  2. 有版本号：dep_version <= last_vulnerable_version → 受影响
+  3. 无版本号：LLM 兜底判断
 
 用法:
-    python cve_matcher.py [--dep-file data/dep_scan_result.xlsx] [--cve-file data/cve_version_result.xlsx]
+    python cve_matcher.py [--dep-file ...] [--cve-file ...] [--base-url ...] [--api-key ...] [--model ...]
 """
 
 import argparse
@@ -11,8 +16,8 @@ import json
 import logging
 import os
 import re
-from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+import sqlite3
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
@@ -28,7 +33,7 @@ LOGGER = logging.getLogger("cve_matcher")
 
 
 # ===================================================================
-# 版本工具函数（从 workflow_unified.py 复用）
+# 版本工具函数
 # ===================================================================
 
 def normalize_version(version: str) -> str:
@@ -69,101 +74,14 @@ def compare_versions(left: str, right: str) -> int:
 
 
 # ===================================================================
-# CVE 描述中的版本匹配（从 workflow_unified.py 复用）
-# ===================================================================
-
-VERSION_TEXT_REGEX = re.compile(r"\d+\.\d+(?:\.\d+){0,3}")
-EXPLICIT_RANGE_HINTS = ("before", "prior to", "through", "up to", "upto", "starting in version", "from ")
-START_BEFORE_RANGE_REGEX = re.compile(
-    r"starting in version\s+(?P<lower>\d+\.\d+(?:\.\d+){0,3})\s+and\s+(?P<mode>prior to|before)\s+version\s+(?P<upper>\d+\.\d+(?:\.\d+){0,3})",
-    re.IGNORECASE,
-)
-GENERIC_BOUNDED_RANGE_REGEX = re.compile(
-    r"(?:from\s+)?(?P<lower>\d+\.\d+(?:\.\d+){0,3})\s+through\s+(?P<upper>\d+\.\d+(?:\.\d+){0,3})",
-    re.IGNORECASE,
-)
-BRANCH_BEFORE_REGEX = re.compile(
-    r"(?P<branch>\d+(?:\.\d+)*)\.x\s+before\s+(?P<upper>\d+\.\d+(?:\.\d+){0,3})",
-    re.IGNORECASE,
-)
-GENERIC_UPPER_BOUND_REGEX = re.compile(
-    r"(?P<mode>before|prior to|through|up to|upto)\s+(?:versions?\s+)?(?P<upper>\d+\.\d+(?:\.\d+){0,3})",
-    re.IGNORECASE,
-)
-
-
-def version_matches_branch(version: str, branch: str) -> bool:
-    version_parts = parse_version_parts(version)
-    branch_parts = parse_version_parts(branch)
-    if not version_parts or not branch_parts or len(version_parts) < len(branch_parts):
-        return False
-    return version_parts[:len(branch_parts)] == branch_parts
-
-
-def simple_version_matches(description: str, version: str) -> Optional[bool]:
-    """返回 True/False/None（None 表示无法判断，需要 LLM 兜底）"""
-    desc = (description or "").lower()
-    version = normalize_version(version)
-    if not version:
-        return None
-
-    # 精确匹配
-    patterns = [re.escape(version), re.escape(version).replace("\\.", r"[._-]?")]
-    if any(re.search(pattern, desc) for pattern in patterns):
-        return True
-
-    saw_explicit_constraint = False
-
-    for match in START_BEFORE_RANGE_REGEX.finditer(desc):
-        saw_explicit_constraint = True
-        lower = match.group("lower")
-        upper = match.group("upper")
-        if compare_versions(version, lower) >= 0 and compare_versions(version, upper) < 0:
-            return True
-
-    for match in GENERIC_BOUNDED_RANGE_REGEX.finditer(desc):
-        saw_explicit_constraint = True
-        lower = match.group("lower")
-        upper = match.group("upper")
-        if compare_versions(version, lower) >= 0 and compare_versions(version, upper) <= 0:
-            return True
-
-    for match in BRANCH_BEFORE_REGEX.finditer(desc):
-        saw_explicit_constraint = True
-        branch = match.group("branch")
-        upper = match.group("upper")
-        if version_matches_branch(version, branch):
-            return compare_versions(version, upper) < 0
-
-    for match in GENERIC_UPPER_BOUND_REGEX.finditer(desc):
-        saw_explicit_constraint = True
-        upper = match.group("upper")
-        mode = match.group("mode").lower()
-        if mode in {"through", "up to", "upto"}:
-            if compare_versions(version, upper) <= 0:
-                return True
-        else:
-            if compare_versions(version, upper) < 0:
-                return True
-
-    mentioned_versions = [normalize_version(item) for item in VERSION_TEXT_REGEX.findall(desc)]
-    mentioned_versions = [item for item in mentioned_versions if item]
-    if mentioned_versions and any(hint in desc for hint in EXPLICIT_RANGE_HINTS):
-        highest_mentioned = mentioned_versions[0]
-        for candidate in mentioned_versions[1:]:
-            if compare_versions(candidate, highest_mentioned) > 0:
-                highest_mentioned = candidate
-        if compare_versions(version, highest_mentioned) > 0:
-            return False
-
-    if saw_explicit_constraint:
-        return False
-    return None
-
-
-# ===================================================================
 # LLM 兜底判断
 # ===================================================================
+
+def _sanitize_version(ver: str) -> str:
+    """过滤 NaN → '' """
+    ver = str(ver).strip()
+    return "" if ver.lower() in ("", "nan", "na", "n/a") else ver
+
 
 def call_openai_judge(base_url: str, api_key: str, model: str,
                       component: str, version: str, cve: str, description: str) -> Optional[bool]:
@@ -222,118 +140,96 @@ def call_openai_judge(base_url: str, api_key: str, model: str,
 # Phase 3 匹配逻辑
 # ===================================================================
 
+def _is_empty_version(ver: str) -> bool:
+    return _sanitize_version(ver) == ""
+
+
 def match_component_to_cves(
-    component: str, version: str, cve_df: pd.DataFrame,
-    base_url: str, api_key: str, model: str,
+    component: str, version: str, cve_with_ver: pd.DataFrame,
+    cve_no_ver: pd.DataFrame, base_url: str, api_key: str, model: str,
 ) -> List[Dict[str, str]]:
-    """
-    将单个组件的版本与 CVE 数据库匹配。
-    匹配策略：
-    1. 组件名匹配（精确或相互包含）
-    2. 版本比较：dep_version <= last_vulnerable_version
-    3. 正则兜底：用 CVE 描述中的版本范围做精确判断
-    4. LLM 兜底：对无法判断的边界情况
-    """
+    """组件名匹配 + 版本比较 / LLM 兜底"""
     normalized_component = normalize_package_name(component)
     matched: List[Dict[str, str]] = []
-    seen_cves = set()
+    seen_cves: set = set()
 
-    for _, row in cve_df.iterrows():
-        cve_component = str(row["Component"])
+    # --- 有版本号的 CVE：版本比对 ---
+    for _, row in cve_with_ver.iterrows():
         cve_id = str(row["CVE"])
-        last_vuln_ver = str(row.get("LastVulnerableVersion", "")).strip()
-        extraction_method = str(row.get("ExtractionMethod", ""))
-
-        # CVE 去重
         if cve_id in seen_cves:
             continue
         seen_cves.add(cve_id)
 
-        # 组件名匹配
-        cve_component_norm = normalize_package_name(cve_component)
+        cve_component_norm = normalize_package_name(str(row["Component"]))
         if normalized_component not in cve_component_norm and cve_component_norm not in normalized_component:
             continue
 
         dep_version = normalize_version(version)
-        determination = ""
+        last_vuln_norm = normalize_version(str(row["LastVulnerableVersion"]))
 
-        if last_vuln_ver:
-            last_vuln_normalized = normalize_version(last_vuln_ver)
-            # 版本号比较：使用版本 <= 最后有漏洞版本 → 潜在受影响
-            cmp = compare_versions(dep_version, last_vuln_normalized)
-            if cmp <= 0:
-                # 再用 CVE 描述做二次确认
-                heuristic = simple_version_matches(str(row.get("description", "")), dep_version)
-                if heuristic is True:
-                    determination = "regex"
-                elif heuristic is False:
-                    # 正则明确表明不受影响，跳过
-                    continue
-                else:
-                    # heuristic 为 None，用版本号比较结果
-                    determination = f"version_cmp_{extraction_method}"
-            else:
-                # 版本高于有漏洞版本，可能已修复，跳过
-                continue
+        cmp = compare_versions(dep_version, last_vuln_norm)
+        if cmp <= 0:
+            determination = f"version_cmp_{row.get('ExtractionMethod', '')}"
         else:
-            # 没有提取到版本号，用 CVE 描述直接做正则匹配
-            description = str(row.get("description", ""))
-            heuristic = simple_version_matches(description, dep_version)
-            if heuristic is True:
-                determination = "regex"
-            elif heuristic is False:
-                continue
-            else:
-                # LLM 兜底
-                if base_url and api_key and model:
-                    llm_result = call_openai_judge(
-                        base_url, api_key, model,
-                        component, dep_version, cve_id, description or ""
-                    )
-                    if llm_result is True:
-                        determination = "llm"
-                    elif llm_result is False:
-                        continue
-                    else:
-                        determination = "llm_uncertain"
-                else:
-                    determination = "uncertain"
-
+            determination = "version_above_vuln"
         matched.append({
             "CVE": cve_id,
-            "LastVulnerableVersion": last_vuln_ver,
+            "LastVulnerableVersion": str(row["LastVulnerableVersion"]),
             "Determination": determination,
         })
+
+    # --- 无版本号的 CVE：LLM 兜底 ---
+    for _, row in cve_no_ver.iterrows():
+        cve_id = str(row["CVE"])
+        if cve_id in seen_cves:
+            continue
+        seen_cves.add(cve_id)
+
+        cve_component_norm = normalize_package_name(str(row["Component"]))
+        if normalized_component not in cve_component_norm and cve_component_norm not in normalized_component:
+            continue
+
+        description = str(row.get("description", ""))
+        llm_result = call_openai_judge(base_url, api_key, model,
+                                       component, version, cve_id, description or "")
+        if llm_result is True:
+            matched.append({
+                "CVE": cve_id,
+                "LastVulnerableVersion": "",
+                "Determination": "llm",
+            })
+            LOGGER.info("  LLM hit: %s / %s=%s", cve_id, component, version)
 
     return matched
 
 
 def run_phase3(dep_df: pd.DataFrame, cve_df: pd.DataFrame,
                base_url: str, api_key: str, model: str) -> pd.DataFrame:
-    """Phase 3 主入口：双向匹配"""
+    """Phase 3 主入口"""
     result_rows: List[Dict] = []
 
-    # 为了在匹配时访问 CVE 描述，把 vuln_ruler.db 中的 content_preview 也加载出来
-    # cve_df 只有 CVE / Component / LastVulnerableVersion / ExtractionMethod
-    # 需要合并 description
+    # 处理版本号
     cve_df = cve_df.copy()
-    if "description" not in cve_df.columns:
-        # 从 DB 加载
+    cve_df["_clean_ver"] = cve_df["LastVulnerableVersion"].apply(_sanitize_version)
+    cve_no_ver = cve_df[cve_df["_clean_ver"] == ""].copy()
+    cve_with_ver = cve_df[cve_df["_clean_ver"] != ""].copy()
+
+    # 为无版本号的 CVE 加载描述
+    if not cve_no_ver.empty and base_url and api_key and model:
         try:
-            import sqlite3
             conn = sqlite3.connect("vuln_ruler.db")
             conn.row_factory = sqlite3.Row
-            rows = conn.execute("""
-                SELECT c.cve_id, c.content_preview
-                FROM cve_records c
-            """).fetchall()
+            rows = conn.execute("SELECT cve_id, content_preview FROM cve_records").fetchall()
             conn.close()
             desc_map = {r["cve_id"]: (r["content_preview"] or "") for r in rows}
-            cve_df["description"] = cve_df["CVE"].map(desc_map).fillna("")
-            LOGGER.info("Merged %d CVE descriptions from DB", len(desc_map))
+            cve_no_ver["description"] = cve_no_ver["CVE"].map(desc_map).fillna("")
+            LOGGER.info("Loaded descriptions for %d no-version CVEs", len(cve_no_ver))
         except Exception as exc:
             LOGGER.warning("Failed to load CVE descriptions: %s", exc)
-            cve_df["description"] = ""
+            cve_no_ver["description"] = ""
+
+    LOGGER.info("CVE records: %d with version, %d no-version (LLM fallback)",
+                len(cve_with_ver), len(cve_no_ver))
 
     total = len(dep_df)
     for i, (_, dep_row) in enumerate(dep_df.iterrows()):
@@ -344,8 +240,7 @@ def run_phase3(dep_df: pd.DataFrame, cve_df: pd.DataFrame,
         source_file = str(dep_row.get("SourceFile", ""))
 
         matched_cves = match_component_to_cves(
-            component, version, cve_df,
-            base_url, api_key, model,
+            component, version, cve_with_ver, cve_no_ver, base_url, api_key, model,
         )
 
         if matched_cves:
@@ -415,17 +310,15 @@ def main() -> None:
     result_df.to_excel(args.output, index=False)
     LOGGER.info("Phase 3 output written to %s (%d rows)", args.output, len(result_df))
 
-    # 打印统计
     if not result_df.empty:
         LOGGER.info("=== Summary ===")
         LOGGER.info("Total matches: %d", len(result_df))
         LOGGER.info("Unique repos affected: %d", result_df["RepoName"].nunique())
         LOGGER.info("Unique components affected: %d", result_df["Component"].nunique())
         LOGGER.info("Unique CVEs matched: %d", result_df["CVE"].nunique())
-        if "Determination" in result_df.columns:
-            determ_counts = result_df["Determination"].value_counts().to_dict()
-            for k, v in determ_counts.items():
-                LOGGER.info("  %s: %d", k, v)
+        determ_counts = result_df["Determination"].value_counts().to_dict()
+        for k, v in determ_counts.items():
+            LOGGER.info("  %s: %d", k, v)
 
 
 if __name__ == "__main__":
