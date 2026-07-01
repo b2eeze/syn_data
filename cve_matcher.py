@@ -12,16 +12,23 @@ import logging
 import os
 import re
 import sqlite3
+import threading
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # 配置
 # ---------------------------------------------------------------------------
 REQUEST_TIMEOUT = 60
 LLM_JUDGE_CACHE: Dict[Tuple[str, str, str], Optional[bool]] = {}
+LLM_JUDGE_LOCK = threading.Lock()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 LOGGER = logging.getLogger("cve_matcher")
@@ -72,10 +79,37 @@ def compare_versions(left: str, right: str) -> int:
 # LLM 兜底判断
 # ===================================================================
 
-def _sanitize_version(ver: str) -> str:
-    """过滤 NaN → '' """
-    ver = str(ver).strip()
-    return "" if ver.lower() in ("", "nan", "na", "n/a") else ver
+def _parse_ranges(ranges_str: str) -> List[List]:
+    """解析版本区间 JSON，解析失败返回空列表。"""
+    if not ranges_str or not isinstance(ranges_str, str):
+        return []
+    try:
+        parsed = json.loads(ranges_str)
+        if isinstance(parsed, list):
+            return parsed
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return []
+
+
+def _version_in_any_range(version: str, ranges: List[List]) -> bool:
+    """检查 version 是否在任一区间内。"""
+    for r in ranges:
+        if len(r) != 3:
+            continue
+        lower, upper, inclusive = str(r[0]), str(r[1]), int(r[2])
+        # 下界比较
+        if lower:
+            if compare_versions(version, lower) < 0:
+                continue  # version < lower, 不在本区间
+        # 上界比较
+        if inclusive:
+            if compare_versions(version, upper) <= 0:
+                return True
+        else:
+            if compare_versions(version, upper) < 0:
+                return True
+    return False
 
 
 def call_openai_judge(base_url: str, api_key: str, model: str,
@@ -83,8 +117,9 @@ def call_openai_judge(base_url: str, api_key: str, model: str,
     if not (base_url and api_key and model):
         return None
     cache_key = (normalize_package_name(component), normalize_version(version), str(cve).strip())
-    if cache_key in LLM_JUDGE_CACHE:
-        return LLM_JUDGE_CACHE[cache_key]
+    with LLM_JUDGE_LOCK:
+        if cache_key in LLM_JUDGE_CACHE:
+            return LLM_JUDGE_CACHE[cache_key]
 
     url = base_url.rstrip("/") + "/chat/completions"
     prompt = (
@@ -122,12 +157,14 @@ def call_openai_judge(base_url: str, api_key: str, model: str,
         parsed = json.loads(stripped_content)
         is_direct = parsed.get("is_direct", True)
         result = bool(parsed.get("affected")) and bool(is_direct)
-        LLM_JUDGE_CACHE[cache_key] = result
+        with LLM_JUDGE_LOCK:
+            LLM_JUDGE_CACHE[cache_key] = result
         return result
     except Exception as exc:
         details = f" response_text={response_text[:1000]}" if response_text else ""
         LOGGER.warning("LLM judge failed for %s: %s%s", cve, exc, details)
-        LLM_JUDGE_CACHE[cache_key] = None
+        with LLM_JUDGE_LOCK:
+            LLM_JUDGE_CACHE[cache_key] = None
         return None
 
 
@@ -135,81 +172,123 @@ def call_openai_judge(base_url: str, api_key: str, model: str,
 # Phase 3 匹配逻辑
 # ===================================================================
 
-def _is_empty_version(ver: str) -> bool:
-    return _sanitize_version(ver) == ""
+
+def _build_cve_index(cve_with_ver: pd.DataFrame) -> Dict[str, List[Tuple[str, str, str]]]:
+    """预构建 CVE 索引: {normalized_component: [(cve_id, ranges_str, method), ...]}"""
+    index: Dict[str, List[Tuple[str, str, str]]] = defaultdict(list)
+    for _, row in cve_with_ver.iterrows():
+        comp_norm = normalize_package_name(str(row["Component"]))
+        index[comp_norm].append((
+            str(row["CVE"]),
+            str(row.get("VulnerableVersionRanges", "")),
+            str(row.get("ExtractionMethod", "")),
+        ))
+    return dict(index)
 
 
 def match_component_to_cves(
-    component: str, version: str, cve_with_ver: pd.DataFrame,
-    cve_no_ver: pd.DataFrame, base_url: str, api_key: str, model: str,
+    component: str, version: str,
+    cve_index: Dict[str, List[Tuple[str, str, str]]],
+    cve_no_ver_index: Dict[str, List[Tuple[str, str]]],
+    base_url: str, api_key: str, model: str,
 ) -> List[Dict[str, str]]:
-    """组件名匹配 + 版本比较 / LLM 兜底"""
+    """组件名匹配 + 版本比较 / LLM 兜底（使用预构建索引）"""
     normalized_component = normalize_package_name(component)
+    dep_version = normalize_version(version)
     matched: List[Dict[str, str]] = []
     seen_cves: set = set()
 
-    # --- 有版本号的 CVE：版本比对 ---
-    for _, row in cve_with_ver.iterrows():
-        cve_id = str(row["CVE"])
-        if cve_id in seen_cves:
+    # --- 有版本区间的 CVE：用索引做 O(1) 查找 ---
+    for comp_norm, cve_list in cve_index.items():
+        if normalized_component not in comp_norm and comp_norm not in normalized_component:
             continue
-        seen_cves.add(cve_id)
-
-        cve_component_norm = normalize_package_name(str(row["Component"]))
-        if normalized_component not in cve_component_norm and cve_component_norm not in normalized_component:
-            continue
-
-        dep_version = normalize_version(version)
-        last_vuln_norm = normalize_version(str(row["LastVulnerableVersion"]))
-
-        cmp = compare_versions(dep_version, last_vuln_norm)
-        if cmp <= 0:
-            determination = f"version_cmp_{row.get('ExtractionMethod', '')}"
-        else:
-            determination = "version_above_vuln"
-        matched.append({
-            "CVE": cve_id,
-            "LastVulnerableVersion": str(row["LastVulnerableVersion"]),
-            "Determination": determination,
-        })
+        for cve_id, ranges_str, method in cve_list:
+            if cve_id in seen_cves:
+                continue
+            seen_cves.add(cve_id)
+            ranges = _parse_ranges(ranges_str)
+            if ranges and _version_in_any_range(dep_version, ranges):
+                matched.append({
+                    "CVE": cve_id,
+                    "VulnerableVersionRanges": ranges_str,
+                    "Determination": f"version_cmp_{method}",
+                })
+            elif ranges:
+                continue  # 版本在区间外
+            else:
+                matched.append({
+                    "CVE": cve_id,
+                    "VulnerableVersionRanges": ranges_str,
+                    "Determination": "version_no_range",
+                })
 
     # --- 无版本号的 CVE：LLM 兜底 ---
-    for _, row in cve_no_ver.iterrows():
-        cve_id = str(row["CVE"])
-        if cve_id in seen_cves:
+    for comp_norm, cve_list in cve_no_ver_index.items():
+        if normalized_component not in comp_norm and comp_norm not in normalized_component:
             continue
-        seen_cves.add(cve_id)
-
-        cve_component_norm = normalize_package_name(str(row["Component"]))
-        if normalized_component not in cve_component_norm and cve_component_norm not in normalized_component:
-            continue
-
-        description = str(row.get("description", ""))
-        llm_result = call_openai_judge(base_url, api_key, model,
-                                       component, version, cve_id, description or "")
-        if llm_result is True:
-            matched.append({
-                "CVE": cve_id,
-                "LastVulnerableVersion": "",
-                "Determination": "llm",
-            })
-            LOGGER.info("  LLM hit: %s / %s=%s", cve_id, component, version)
+        for cve_id, description in cve_list:
+            if cve_id in seen_cves:
+                continue
+            seen_cves.add(cve_id)
+            llm_result = call_openai_judge(base_url, api_key, model,
+                                           component, version, cve_id, description or "")
+            if llm_result is True:
+                matched.append({
+                    "CVE": cve_id,
+                    "VulnerableVersionRanges": "",
+                    "Determination": "llm",
+                })
+                LOGGER.info("  LLM hit: %s / %s=%s", cve_id, component, version)
 
     return matched
 
 
+def _process_one_dep(dep_row: pd.Series, cve_index, cve_no_ver_index,
+                     base_url: str, api_key: str, model: str) -> List[Dict]:
+    """处理单个依赖记录，返回匹配结果列表。"""
+    repo_name = str(dep_row["RepoName"])
+    tag = str(dep_row["Tag"])
+    component = str(dep_row["Component"])
+    version = str(dep_row["Version"])
+    source_file = str(dep_row.get("SourceFile", ""))
+
+    matched_cves = match_component_to_cves(
+        component, version, cve_index, cve_no_ver_index,
+        base_url, api_key, model,
+    )
+    results = []
+    for m in matched_cves:
+        results.append({
+            "RepoName": repo_name,
+            "Tag": tag,
+            "Component": component,
+            "UsedVersion": version,
+            "SourceFile": source_file,
+            "CVE": m["CVE"],
+            "VulnerableVersionRanges": m.get("VulnerableVersionRanges", ""),
+            "Determination": m["Determination"],
+        })
+    return results
+
+
 def run_phase3(dep_df: pd.DataFrame, cve_df: pd.DataFrame,
-               base_url: str, api_key: str, model: str) -> pd.DataFrame:
-    """Phase 3 主入口"""
-    result_rows: List[Dict] = []
+               base_url: str, api_key: str, model: str,
+               workers: int = 8) -> pd.DataFrame:
+    """Phase 3 主入口（支持并行 LLM 调用）"""
+    cve_df = cve_df.copy()
 
     # 处理版本号
-    cve_df = cve_df.copy()
-    cve_df["_clean_ver"] = cve_df["LastVulnerableVersion"].apply(_sanitize_version)
-    cve_no_ver = cve_df[cve_df["_clean_ver"] == ""].copy()
-    cve_with_ver = cve_df[cve_df["_clean_ver"] != ""].copy()
+    cve_df["_has_ranges"] = cve_df["VulnerableVersionRanges"].apply(
+        lambda v: bool(v) if isinstance(v, str) and v.strip() and v.strip() != "[]" else False
+    )
+    cve_no_ver = cve_df[~cve_df["_has_ranges"]].copy()
+    cve_with_ver = cve_df[cve_df["_has_ranges"]].copy()
 
-    # 为无版本号的 CVE 加载描述
+    # 预构建 CVE 索引
+    cve_index = _build_cve_index(cve_with_ver)
+
+    # 为无版本号的 CVE 构建索引并加载描述
+    cve_no_ver_index: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
     if not cve_no_ver.empty and base_url and api_key and model:
         try:
             conn = sqlite3.connect("vuln_ruler_filtered.db")
@@ -217,57 +296,69 @@ def run_phase3(dep_df: pd.DataFrame, cve_df: pd.DataFrame,
             rows = conn.execute("SELECT cve_id, content_preview FROM cve_records").fetchall()
             conn.close()
             desc_map = {r["cve_id"]: (r["content_preview"] or "") for r in rows}
-            cve_no_ver["description"] = cve_no_ver["CVE"].map(desc_map).fillna("")
-            LOGGER.info("Loaded descriptions for %d no-version CVEs", len(cve_no_ver))
+            for _, row in cve_no_ver.iterrows():
+                comp_norm = normalize_package_name(str(row["Component"]))
+                cve_id = str(row["CVE"])
+                desc = desc_map.get(cve_id, "")
+                cve_no_ver_index[comp_norm].append((cve_id, desc))
+            LOGGER.info("Built no-ver index for %d components (%d CVEs)",
+                        len(cve_no_ver_index), len(cve_no_ver))
         except Exception as exc:
             LOGGER.warning("Failed to load CVE descriptions: %s", exc)
-            cve_no_ver["description"] = ""
 
-    LOGGER.info("CVE records: %d with version, %d no-version (LLM fallback)",
-                len(cve_with_ver), len(cve_no_ver))
+    LOGGER.info("CVE records: %d with version (%d groups), %d no-version (LLM, %d groups)",
+                len(cve_with_ver), len(cve_index), len(cve_no_ver), len(cve_no_ver_index))
 
-    total = len(dep_df)
-    for i, (_, dep_row) in enumerate(dep_df.iterrows()):
-        repo_name = str(dep_row["RepoName"])
-        tag = str(dep_row["Tag"])
-        component = str(dep_row["Component"])
-        version = str(dep_row["Version"])
-        source_file = str(dep_row.get("SourceFile", ""))
+    result_rows: List[Dict] = []
 
-        matched_cves = match_component_to_cves(
-            component, version, cve_with_ver, cve_no_ver, base_url, api_key, model,
-        )
-
-        if matched_cves:
-            for m in matched_cves:
-                result_rows.append({
-                    "RepoName": repo_name,
-                    "Tag": tag,
-                    "Component": component,
-                    "UsedVersion": version,
-                    "SourceFile": source_file,
-                    "CVE": m["CVE"],
-                    "VulnerableVersion": m["LastVulnerableVersion"],
-                    "Determination": m["Determination"],
-                })
-            LOGGER.info("[%d/%d] %s @ %s / %s %s: %d CVE hits",
-                        i + 1, total, repo_name, tag, component, version, len(matched_cves))
-        else:
-            LOGGER.info("[%d/%d] %s @ %s / %s %s: no CVE hits",
-                        i + 1, total, repo_name, tag, component, version)
+    if workers > 1:
+        LOGGER.info("Using %d workers for parallel processing", workers)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(
+                    _process_one_dep, row, cve_index, cve_no_ver_index,
+                    base_url, api_key, model,
+                ): i for i, (_, row) in enumerate(dep_df.iterrows())
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    matched = future.result()
+                    result_rows.extend(matched)
+                    if matched:
+                        m = matched[0]
+                        LOGGER.info("[%d/%d] %s @ %s / %s %s: %d CVE hits",
+                                    idx + 1, len(dep_df), m["RepoName"], m["Tag"],
+                                    m["Component"], m["UsedVersion"], len(matched))
+                except Exception as exc:
+                    LOGGER.warning("Worker failed for dep row %d: %s", idx, exc)
+    else:
+        total = len(dep_df)
+        for i, (_, dep_row) in enumerate(dep_df.iterrows()):
+            matched = _process_one_dep(dep_row, cve_index, cve_no_ver_index,
+                                       base_url, api_key, model)
+            result_rows.extend(matched)
+            repo_name = str(dep_row["RepoName"])
+            component = str(dep_row["Component"])
+            version = str(dep_row["Version"])
+            if matched:
+                LOGGER.info("[%d/%d] %s / %s %s: %d CVE hits",
+                            i + 1, total, repo_name, component, version, len(matched))
 
     if result_rows:
         df = pd.DataFrame(result_rows, columns=[
             "RepoName", "Tag", "Component", "UsedVersion", "SourceFile",
-            "CVE", "VulnerableVersion", "Determination",
+            "CVE", "VulnerableVersionRanges", "Determination",
         ])
     else:
         df = pd.DataFrame(columns=[
             "RepoName", "Tag", "Component", "UsedVersion", "SourceFile",
-            "CVE", "VulnerableVersion", "Determination",
+            "CVE", "VulnerableVersionRanges", "Determination",
         ])
 
-    LOGGER.info("Phase 3 complete: %d total matches", len(df))
+    before_dedup = len(df)
+    df = df.drop_duplicates(subset=["RepoName", "Tag", "Component", "UsedVersion", "CVE"])
+    LOGGER.info("Phase 3 complete: %d total matches (%d duplicates removed)", len(df), before_dedup - len(df))
     return df
 
 
@@ -286,6 +377,8 @@ def parse_args() -> argparse.Namespace:
                         help="API key（也可用 LLM_API_KEY 环境变量）")
     parser.add_argument("--model", default=os.environ.get("LLM_MODEL", ""),
                         help="模型名（也可用 LLM_MODEL 环境变量）")
+    parser.add_argument("--workers", type=int, default=8,
+                        help="并行 worker 数（默认 8）")
     return parser.parse_args()
 
 
@@ -301,7 +394,8 @@ def main() -> None:
     LOGGER.info("Loaded %d CVE version records", len(cve_df))
 
     LOGGER.info("==== Phase 3: CVE Matching ====")
-    result_df = run_phase3(dep_df, cve_df, args.base_url, args.api_key, args.model)
+    result_df = run_phase3(dep_df, cve_df, args.base_url, args.api_key, args.model,
+                           workers=args.workers)
     result_df.to_excel(args.output, index=False)
     LOGGER.info("Phase 3 output written to %s (%d rows)", args.output, len(result_df))
 

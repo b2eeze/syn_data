@@ -4,7 +4,18 @@ __pycache__/
 .DS_Store
 *.db-journal
 repos_cache/
+run_output/
+run_bk/
 workflow_cache/
+result/
 .env
-# vuln_ruler_filtered.db
+.claude/
+data/_bk/
+data/cve_match_result.xlsx
+data/cve_version_result.xlsx
+data/dep_scan_result.xlsx
+verify/deepseek_consistency_results.csv
+verify/vulnerability_descriptions_full.json
+llm_status.json
 vuln_ruler.db
+vuln_ruler_filtered.db

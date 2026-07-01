@@ -16,6 +16,7 @@ import sqlite3
 import subprocess
 import shutil
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +24,9 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 import cve_checkpoint
 
@@ -706,7 +710,7 @@ def _build_prompt(cve_id: str, component: str, used_version: str, vuln_version: 
         f"**CVE 编号**: {cve_id}\n"
         f"**组件**: {component}\n"
         f"**当前使用版本**: {used_version}\n"
-        f"**最后漏洞版本**: {vuln_version}\n\n"
+        f"**漏洞版本区间**: {vuln_version}\n\n"
         f"**CVE 信息**:\n{cve_info_block}\n\n"
         f"**项目中对 {component} 的实际调用代码（含完整函数上下文，标注了 ← 命中的行）**:\n{call_site_text}\n\n"
         "## 任务：先判定注入适配性，再分类执行\n\n"
@@ -762,6 +766,7 @@ def _call_llm_once(base_url: str, api_key: str, model: str, prompt: str,
     url = base_url.rstrip("/") + "/chat/completions"
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
     response_text = ""
+    response = None
 
     log_record = {
         "cve_id": cve_id,
@@ -786,7 +791,9 @@ def _call_llm_once(base_url: str, api_key: str, model: str, prompt: str,
                 ],
                 "temperature": 0,
             }
-            response = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
+            session = requests.Session()
+            session.trust_env = False
+            response = session.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
             response_text = response.text or ""
             response.raise_for_status()
             data = response.json()
@@ -802,16 +809,27 @@ def _call_llm_once(base_url: str, api_key: str, model: str, prompt: str,
             LOGGER.warning("LLM JSON parse failed for %s batch %d (%d/%d): %s",
                            cve_id, batch_idx, attempt, LLM_MAX_RETRIES, exc)
             if attempt < LLM_MAX_RETRIES:
+                time.sleep(2 ** attempt)
                 continue
             log_record["error"] = str(exc)
             log_record["response_raw"] = response_text[:2000] if response_text else None
             log_record["retries"] = attempt
             return None
         except Exception as exc:
+            # 区分 429 限流和其他错误
+            is_rate_limited = False
+            try:
+                if response is not None and response.status_code == 429:
+                    is_rate_limited = True
+            except Exception:
+                pass
             details = f" response_text={response_text[:500]}" if response_text else ""
             LOGGER.warning("LLM analysis failed for %s batch %d (%d/%d): %s%s",
                            cve_id, batch_idx, attempt, LLM_MAX_RETRIES, exc, details)
             if attempt < LLM_MAX_RETRIES:
+                wait = 5 * (2 ** attempt) if is_rate_limited else (2 ** attempt)
+                LOGGER.info("  Retrying %s in %ds...", cve_id, wait)
+                time.sleep(wait)
                 continue
             log_record["error"] = f"{exc}{details}"
             log_record["response_raw"] = response_text[:2000] if response_text else None
@@ -965,7 +983,14 @@ def _save_patch_and_restore(repo_path: Path, patch_dir: Path, cve_id: str, repo_
         safe_cve = cve_id.replace("/", "_").replace(" ", "_")
         safe_repo = repo_name.replace("/", "_").replace(" ", "_")
         safe_tag = tag.replace("/", "_").replace(" ", "_")
-        patch_path = patch_dir / f"{safe_cve}__{safe_repo}__{safe_tag}.patch"
+        base_name = f"{safe_cve}__{safe_repo}__{safe_tag}"
+        patch_path = patch_dir / f"{base_name}.patch"
+        # 同名 patch 已存在时加序号，避免覆盖
+        if patch_path.exists():
+            counter = 2
+            while patch_path.exists():
+                patch_path = patch_dir / f"{base_name}_{counter}.patch"
+                counter += 1
         diff_result = subprocess.run(
             ["git", "diff"],
             cwd=str(repo_path), capture_output=True, text=True, timeout=30
@@ -1448,6 +1473,7 @@ def run_phase4(
     match_df: pd.DataFrame,
     vuln_db_path: str,
     cache_dir: Path,
+    run_dir: Path,
     base_url: str,
     api_key: str,
     model: str,
@@ -1483,7 +1509,7 @@ def run_phase4(
     LOGGER.info("Total unique repo*Tag combinations to process: %d", len(unique_repos))
 
     # ---- 断点续传：加载已有进度，跳过已处理的 (repo, tag) ----
-    progress_path = cache_dir / "_vuln_injection_progress.json"
+    progress_path = run_dir / "_vuln_injection_progress.json"
     processed_keys: set = set()
     result_rows: List[dict] = []
     repo_processed_base = 0
@@ -1535,7 +1561,7 @@ def run_phase4(
                     "Component": str(match["Component"]),
                     "UsedVersion": str(match["UsedVersion"]),
                     "CVE": str(match["CVE"]),
-                    "VulnerableVersion": str(match.get("VulnerableVersion", "") or ""),
+                    "VulnerableVersionRanges": str(match.get("VulnerableVersionRanges", "") or ""),
                     "Determination": str(match.get("Determination", "")),
                     "ModifiedFiles": "", "PatchFile": "",
                     "InjectionSummary": "Clone failed", "Reason": "",
@@ -1558,7 +1584,7 @@ def run_phase4(
         def _find_sites(_, match):
             component = str(match["Component"])
             used_version = str(match["UsedVersion"])
-            vuln_version = str(match.get("VulnerableVersion", "") or "")
+            vuln_version = str(match.get("VulnerableVersionRanges", "") or "")
             source_file = str(match.get("SourceFile", ""))
             cve_id = str(match["CVE"])
             determination = str(match.get("Determination", ""))
@@ -1579,7 +1605,7 @@ def run_phase4(
                 repo_results.append({
                     "RepoName": repo_name, "Tag": tag,
                     "Component": component, "UsedVersion": used_version,
-                    "CVE": cve_id, "VulnerableVersion": vuln_version,
+                    "CVE": cve_id, "VulnerableVersionRanges": vuln_version,
                     "Determination": determination,
                     "ModifiedFiles": "", "PatchFile": "",
                     "InjectionSummary": "", "Reason": "",
@@ -1601,7 +1627,7 @@ def run_phase4(
 
         # ---- Phase B: 并行 LLM 分析 ----
         if tasks:
-            log_dir = cache_dir / "llm_logs"
+            log_dir = run_dir / "llm_logs"
             max_workers = min(len(tasks), workers) if workers > 0 else min(len(tasks), 5)
 
             def _llm_task(task):
@@ -1645,7 +1671,7 @@ def run_phase4(
                 return {
                     "RepoName": _rn, "Tag": _t,
                     "Component": _c, "UsedVersion": _uv,
-                    "CVE": _cv, "VulnerableVersion": _vv,
+                    "CVE": _cv, "VulnerableVersionRanges": _vv,
                     "Determination": _d,
                     "ModifiedFiles": modified_files, "PatchFile": patch_file,
                     "InjectionSummary": injection_summary, "Reason": reason,
@@ -1687,7 +1713,7 @@ def run_phase4(
                     compilable, compile_error = "skipped", "dry_run"
                 else:
                     compilable, compile_error = check_compilability(repo_path, modified_files)
-                patch_file = _save_patch_and_restore(repo_path, cache_dir / "patches", cve_id, repo_name, tag) or ""
+                patch_file = _save_patch_and_restore(repo_path, run_dir / "patches", cve_id, repo_name, tag) or ""
 
                 if not modified_files:
                     repo_results.append(_row("injection_failed", injection_summary=injection_summary, reason=reason))
@@ -1718,7 +1744,7 @@ def run_phase4(
                     LOGGER.error("Repo %s @ %s failed with exception: %s", rn, tg, exc)
                     repo_results = [{
                         "RepoName": rn, "Tag": tg,
-                        "Component": "", "UsedVersion": "", "CVE": "", "VulnerableVersion": "",
+                        "Component": "", "UsedVersion": "", "CVE": "", "VulnerableVersionRanges": "",
                         "Determination": "", "ModifiedFiles": "", "PatchFile": "",
                         "InjectionSummary": str(exc), "Reason": "",
                         "Compilable": "skipped", "CompileError": "",
@@ -1731,7 +1757,7 @@ def run_phase4(
                         # 同步输出 inject 成功的结果
                         injected_rows = [r for r in result_rows if r.get("Status") == "injected"]
                         if injected_rows:
-                            injected_path = cache_dir / "_vuln_injection_progress_injected.json"
+                            injected_path = run_dir / "_vuln_injection_progress_injected.json"
                             injected_path.write_text(json.dumps(injected_rows, indent=2, ensure_ascii=False), encoding="utf-8")
     else:
         LOGGER.info("No repos to process")
@@ -1740,7 +1766,7 @@ def run_phase4(
         df = pd.DataFrame(result_rows)
     else:
         df = pd.DataFrame(columns=[
-            "RepoName", "Tag", "Component", "UsedVersion", "CVE", "VulnerableVersion",
+            "RepoName", "Tag", "Component", "UsedVersion", "CVE", "VulnerableVersionRanges",
             "Determination", "ModifiedFiles", "PatchFile", "InjectionSummary", "Compilable",
             "CompileError", "Status", "Reason", "Checkpoint",
         ])
@@ -1758,6 +1784,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--match-file", default="data/cve_match_result.xlsx", help="Phase 3 输出")
     parser.add_argument("--vuln-db", default="vuln_ruler_filtered.db", help="漏洞数据库路径")
     parser.add_argument("--cache-dir", default="repos_cache", help="仓库克隆缓存目录")
+    parser.add_argument("--run-dir", default="run_output", help="运行时数据输出目录（日志、patch、进度文件）")
     parser.add_argument("--output", default="", help="Phase 4 输出路径（默认 result/vuln_injection_result_<时间戳>.json）")
     parser.add_argument("--base-url", default=os.environ.get("LLM_BASE_URL", ""),
                         help="API base URL（也可用 LLM_BASE_URL 环境变量）")
@@ -1784,12 +1811,17 @@ def main() -> None:
     LOGGER.info("Loaded %d match records", len(match_df))
 
     cache_dir = Path(args.cache_dir)
+    run_dir = Path(args.run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "patches").mkdir(parents=True, exist_ok=True)
+    (run_dir / "llm_logs").mkdir(parents=True, exist_ok=True)
 
     LOGGER.info("==== Phase 4: Vulnerability Injection Point Prediction ====")
     result_df = run_phase4(
         match_df=match_df,
         vuln_db_path=args.vuln_db,
         cache_dir=cache_dir,
+        run_dir=run_dir,
         base_url=args.base_url,
         api_key=args.api_key,
         model=args.model,

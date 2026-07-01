@@ -346,7 +346,14 @@ def parse_pom_dependencies(content: str, java_targets: Dict, inherited_propertie
         if not gid or not aid or not ver:
             continue
         if ver.startswith("${"):
-            ver = properties.get(ver, ver)
+            seen = set()
+            while ver in properties and ver not in seen:
+                seen.add(ver)
+                ver = properties[ver]
+            if not ver.startswith("${"):
+                pass  # resolved successfully
+            else:
+                ver = properties.get(ver, ver)  # one last attempt
         component = match_java_component(gid, aid, java_targets)
         if component:
             versions.setdefault(component, normalize_version(ver))
@@ -364,12 +371,41 @@ def parse_gradle_properties(content: str) -> Dict[str, str]:
     return properties
 
 
+def parse_gradle_ext_properties(content: str) -> Dict[str, str]:
+    """从 build.gradle 的 ext {} 块中提取属性定义。"""
+    properties: Dict[str, str] = {}
+    # 匹配 ext { key = 'value' 或 key = "value" }
+    # 只处理简单的单行 key = 'version' 模式
+    ext_block = re.search(r'ext\s*\{([^}]+)\}', content, re.DOTALL)
+    if ext_block:
+        for line in ext_block.group(1).splitlines():
+            # key = 'value' 或 key = "value"
+            m = re.match(r'\s*(\w+)\s*=\s*[\'"]([^\'"]+)[\'"]', line)
+            if m:
+                properties[m.group(1)] = m.group(2)
+    return properties
+
+
 def resolve_gradle_placeholders(version: str, properties: Dict[str, str]) -> str:
     version = version.strip().strip("\"'")
-    placeholder_match = re.fullmatch(r"\$\{?([A-Za-z0-9_.\-]+)\}?", version)
-    if placeholder_match:
-        key = placeholder_match.group(1)
-        return properties.get(key, version)
+    # 多轮解析: ${versions.commonsIo} → versions.commonsIo 在 properties 中 → 值
+    seen = set()
+    while True:
+        # 匹配 $key 或 ${key} 或 ${key.subkey}
+        m = re.fullmatch(r'\$\{?([A-Za-z0-9_.\-]+)\}?', version)
+        if not m:
+            break
+        key = m.group(1)
+        if key in seen:
+            break
+        seen.add(key)
+        resolved = properties.get(key)
+        if resolved is None and '.' in key:
+            # ${versions.commonsIo} → 先查 properties 里的 "versions.commonsIo"
+            resolved = properties.get(key)
+        if resolved is None:
+            break
+        version = str(resolved).strip().strip("\"'")
     return version
 
 
@@ -541,6 +577,17 @@ def scan_repo_for_deps(owner: str, repo: str, tag: str, headers: Dict[str, str],
     LOGGER.info("[%s] %s candidate files: py=%d, java=%d, js=%d, rust=%d",
                 tag, repo, len(py_candidates), len(java_candidates), len(js_candidates), len(rust_candidates))
 
+    # 强制获取根级构建文件（大仓库的 git tree 可能被截断）
+    ROOT_BUILD_FILES = ["pom.xml", "build.gradle", "build.gradle.kts",
+                        "settings.gradle", "settings.gradle.kts", "gradle.properties"]
+    for root_file in ROOT_BUILD_FILES:
+        if root_file not in java_candidates:
+            # 只在尚未加入列表时才获取
+            content = fetch_raw_file(owner, repo, tag, root_file, headers)
+            if content is not None:
+                java_candidates.append(root_file)
+                LOGGER.info("[%s] Also fetched root %s (not in tree listing)", tag, root_file)
+
     # Java 解析
     collected_properties: Dict[str, str] = {}
     java_contents: Dict[str, str] = {}
@@ -553,6 +600,8 @@ def scan_repo_for_deps(owner: str, repo: str, tag: str, headers: Dict[str, str],
             collected_properties.update(parse_gradle_properties(content))
         elif path.endswith("pom.xml"):
             collected_properties.update(parse_maven_properties(content))
+        elif path.endswith("build.gradle") or path.endswith("build.gradle.kts"):
+            collected_properties.update(parse_gradle_ext_properties(content))
 
     for path, content in java_contents.items():
         if path.endswith("pom.xml"):

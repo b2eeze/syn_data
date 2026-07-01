@@ -20,7 +20,7 @@ from vuln_injector import check_compilability, clone_repo, _ensure_clean_repo
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 LOGGER = logging.getLogger("recompile")
 
-DEFAULT_INPUT = "repos_cache/_vuln_injection_progress_injected.json"
+DEFAULT_INPUT = "run_output/_vuln_injection_progress_injected.json"
 CACHE_DIR = Path("repos_cache")
 
 
